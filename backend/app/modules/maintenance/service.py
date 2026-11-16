@@ -76,21 +76,9 @@ def _is_engineer(actor: Actor) -> bool:
     return "maintenance_engineer" in actor.roles and "platform_admin" not in actor.roles
 
 
-def _visible_pile_ids(db: Session, actor: Actor) -> Optional[list[int]]:
-    """账号可见的桩；返回 None 表示不限（平台管理员）。"""
-    if "platform_admin" in actor.roles:
-        return None
-    rows = db.execute(
-        text(
-            """select p.pile_id
-                 from charging_pile p
-                 join station st on st.station_id = p.station_id
-                where st.station_id in (select station_id from sys_account_station where account_id = :a)
-                   or st.operator_id in (select operator_id from sys_account_operator where account_id = :a)"""
-        ),
-        {"a": actor.account_id},
-    ).scalars().all()
-    return list(rows)
+def _scope_account(actor: Actor) -> Optional[int]:
+    """返回需要做数据范围过滤的账号；平台管理员返回 None（不限）。"""
+    return None if "platform_admin" in actor.roles else actor.account_id
 
 
 def _scope_pile(db: Session, actor: Actor, pile_id: int) -> None:
@@ -116,6 +104,21 @@ def _work_order_detail(db: Session, wo: m.WorkOrder) -> s.WorkOrderDetail:
     if closed:
         detail.total_seconds = int((closed - wo.assigned_at).total_seconds())
     return detail
+
+
+def _work_order_details(db: Session, rows) -> list:
+    """一页工单只查一次事件摘要，避免逐行两条 SQL 的 N+1。"""
+    summary = dao.event_summaries(db, [r.work_order_id for r in rows])
+    details = []
+    for row in rows:
+        detail = s.WorkOrderDetail.model_validate(row)
+        accepted, closed = summary.get(row.work_order_id, (None, None))
+        if accepted:
+            detail.accept_seconds = int((accepted - row.assigned_at).total_seconds())
+        if closed:
+            detail.total_seconds = int((closed - row.assigned_at).total_seconds())
+        details.append(detail)
+    return details
 
 
 def _list_page(rows, total: int, query) -> PageResult:
@@ -191,7 +194,7 @@ def update_alarm_rule(
 # ---------------------------------------------------------------------------
 def list_alerts(db: Session, *, actor: Actor, query: s.AlertQuery) -> PageResult[s.AlertDetail]:
     _require(actor, PERM_ALERT_READ, PERM_HANDLE)
-    rows, total = dao.list_alerts(db, query, pile_ids=_visible_pile_ids(db, actor))
+    rows, total = dao.list_alerts(db, query, account_id=_scope_account(actor))
     return _list_page([s.AlertDetail.model_validate(r) for r in rows], total, query)
 
 
@@ -216,8 +219,8 @@ def list_work_orders(db: Session, *, actor: Actor, query: s.WorkOrderQuery) -> P
         if query.assigned_to not in (None, actor.account_id):
             raise PermissionError("运维只能查询指派给自己的工单")
         query.assigned_to = actor.account_id
-    rows, total = dao.list_work_orders(db, query, pile_ids=_visible_pile_ids(db, actor))
-    return _list_page([_work_order_detail(db, r) for r in rows], total, query)
+    rows, total = dao.list_work_orders(db, query, account_id=_scope_account(actor))
+    return _list_page(_work_order_details(db, rows), total, query)
 
 
 def get_work_order(db: Session, *, actor: Actor, work_order_id: int) -> s.WorkOrderDetail:

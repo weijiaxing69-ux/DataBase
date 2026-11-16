@@ -5,12 +5,34 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional, Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select, text
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Session
 
 from app.modules.maintenance import models as m
 from app.modules.maintenance import schemas as s
+
+
+SCOPE_ALERT = text(
+    """exists (
+         select 1 from charging_pile p
+           join station st on st.station_id = p.station_id
+          where p.pile_id = device_alert.pile_id
+            and (st.station_id in (select station_id from sys_account_station where account_id = :aid)
+                 or st.operator_id in (select operator_id from sys_account_operator where account_id = :aid))
+       )"""
+)
+
+SCOPE_WORK_ORDER = text(
+    """exists (
+         select 1 from device_alert da
+           join charging_pile p on p.pile_id = da.pile_id
+           join station st on st.station_id = p.station_id
+          where da.alert_id = work_order.alert_id
+            and (st.station_id in (select station_id from sys_account_station where account_id = :aid)
+                 or st.operator_id in (select operator_id from sys_account_operator where account_id = :aid))
+       )"""
+)
 
 
 def _page(db: Session, stmt, page: int, page_size: int):
@@ -58,11 +80,10 @@ def get_alert(db: Session, alert_id: int, *, for_update: bool = False):
     return db.execute(stmt).scalar_one_or_none()
 
 
-def list_alerts(db: Session, q: s.AlertQuery, *, pile_ids: Optional[Sequence[int]] = None):
+def list_alerts(db: Session, q: s.AlertQuery, *, account_id: Optional[int] = None):
     stmt = select(m.DeviceAlert).order_by(m.DeviceAlert.occurred_at.desc())
-    if pile_ids is not None:
-        # 空列表表示没有任何可见桩，直接返回空页
-        stmt = stmt.where(m.DeviceAlert.pile_id.in_(pile_ids or [-1]))
+    if account_id is not None:
+        stmt = stmt.where(SCOPE_ALERT.bindparams(aid=account_id))
     if q.pile_id:
         stmt = stmt.where(m.DeviceAlert.pile_id == q.pile_id)
     if q.status:
@@ -86,14 +107,10 @@ def get_work_order(db: Session, work_order_id: int, *, for_update: bool = False)
     return db.execute(stmt).scalar_one_or_none()
 
 
-def list_work_orders(db: Session, q: s.WorkOrderQuery, *, pile_ids: Optional[Sequence[int]] = None):
+def list_work_orders(db: Session, q: s.WorkOrderQuery, *, account_id: Optional[int] = None):
     stmt = select(m.WorkOrder).order_by(m.WorkOrder.assigned_at.desc())
-    if pile_ids is not None:
-        stmt = stmt.where(
-            m.WorkOrder.alert_id.in_(
-                select(m.DeviceAlert.alert_id).where(m.DeviceAlert.pile_id.in_(pile_ids or [-1]))
-            )
-        )
+    if account_id is not None:
+        stmt = stmt.where(SCOPE_WORK_ORDER.bindparams(aid=account_id))
     if q.status:
         stmt = stmt.where(m.WorkOrder.status == q.status)
     if q.assigned_to:
@@ -141,6 +158,22 @@ def add_event(
     db.add(row)
     db.flush()
     return row
+
+
+def event_summaries(db: Session, work_order_ids: Sequence[int]) -> dict[int, tuple]:
+    """一次查询取回一页工单的「首次接单」与「首次闭环」时间。"""
+    if not work_order_ids:
+        return {}
+    rows = db.execute(
+        select(
+            m.WorkOrderEvent.work_order_id,
+            func.min(case((m.WorkOrderEvent.event_type == "accepted", m.WorkOrderEvent.event_at))),
+            func.min(case((m.WorkOrderEvent.event_type == "closed", m.WorkOrderEvent.event_at))),
+        )
+        .where(m.WorkOrderEvent.work_order_id.in_(list(work_order_ids)))
+        .group_by(m.WorkOrderEvent.work_order_id)
+    ).all()
+    return {row[0]: (row[1], row[2]) for row in rows}
 
 
 def first_event_at(db: Session, work_order_id: int, event_type: str):

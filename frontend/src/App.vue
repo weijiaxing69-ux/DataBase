@@ -4,6 +4,7 @@ import http from './api/http'
 import { login, logout, getCurrentUser } from './api/membership'
 import { listResource, getResource, createResource, updateResource, reviewChangeRequest, issueDeviceCredential } from './api/assets'
 import { resources, labels, values, display } from './resources'
+import MaintenanceBoard from './views/maintenance/MaintenanceBoard.vue'
 
 // 当前账号来自后端 /auth/me；隐藏按钮只是交互提示，真正权限仍由后端检查。
 const account = ref(null)
@@ -80,7 +81,7 @@ async function navigate(key) {
 // 浏览器后退、前进时，让页面跟随地址栏中的资源名称变化。
 function followHash() {
   const key = window.location.hash.slice(1)
-  if (key !== pageKey.value && (resources.some(item => item.key === key) || key === 'demo' && admin.value)) navigate(key)
+  if (key !== pageKey.value && (resources.some(item => item.key === key) || key === 'maintenance' || key === 'demo' && admin.value)) navigate(key)
 }
 function openForm(row = null) {
   selected.value = row
@@ -152,7 +153,7 @@ onMounted(async () => {
   window.addEventListener('session-expired', expired)
   window.addEventListener('hashchange', followHash)
   const initial = window.location.hash.slice(1)
-  if (resources.some(item => item.key === initial) || initial === 'demo') pageKey.value = initial
+  if (resources.some(item => item.key === initial) || initial === 'maintenance' || initial === 'demo') pageKey.value = initial
   if (sessionStorage.getItem('access_token')) {
     await act(async () => { account.value = await getCurrentUser(); await load() })
   }
@@ -178,12 +179,15 @@ onUnmounted(() => {
   <div v-else class="workspace">
     <aside class="sidebar"><div class="wordmark"><span>ϟ</span>充电运营</div><p class="nav-caption">设施管理</p>
       <nav aria-label="主导航"><button v-for="item in resources" :key="item.key" :class="{ active: pageKey === item.key }" @click="navigate(item.key)">{{ item.title }}</button>
+        <p class="nav-caption">设备运维</p>
+        <button :class="{ active: pageKey === 'maintenance' }" @click="navigate('maintenance')">告警与工单</button>
         <button v-if="admin" :class="{ active: pageKey === 'demo' }" @click="navigate('demo')">设备联调</button></nav>
       <div class="sidebar-bottom"><span class="online-dot"></span>本机演示环境<p>独立数据 · 重启清空</p></div>
     </aside>
     <section class="main-content"><header class="topbar"><span>场站与设施 / {{ resource?.title || '设备联调' }}</span><div class="account"><span>{{ account.roles.join(' / ') }}</span><button :disabled="busy" @click="signOut">退出登录</button></div></header>
       <div class="content"><div v-if="error" role="alert" class="error banner">{{ error }}</div><div v-if="notice" role="status" class="success banner">{{ notice }}</div>
-        <template v-if="resource">
+        <MaintenanceBoard v-if="pageKey === 'maintenance'" />
+        <template v-else-if="resource">
           <div class="page-heading"><div><p class="eyebrow">ASSET OPERATIONS</p><h1>{{ resource.title }}管理</h1><p class="muted">查看并维护授权范围内的{{ resource.title }}信息。</p></div><button v-if="canCreate" class="primary" @click="openForm()">新增{{ resource.title }}</button></div>
           <section class="panel"><form class="filters" @submit.prevent="filters.page = 1; load()"><label class="search-label">关键词<input v-model="filters.keyword" placeholder="输入关键词搜索"></label><label v-if="resource.status">状态<select v-model="filters.status"><option value="">全部状态</option><option v-for="status in resource.status" :key="status" :value="status">{{ display(status) }}</option></select></label><button class="primary" :disabled="loading">查询</button><button type="button" :disabled="loading" @click="load">刷新</button><span class="count">共 {{ total }} 条记录</span></form>
             <div class="table-scroll"><table><thead><tr><th v-for="key in resource.columns" :key="key">{{ labels[key] || key }}</th><th>操作</th></tr></thead><tbody>

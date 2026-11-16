@@ -17,6 +17,9 @@ const loading = ref(false)
 const busy = ref(false)
 const error = ref('')
 const notice = ref('')
+const page = ref(1)
+const pageSize = 8
+const total = ref(0)
 let timer = null
 
 const LEVEL = { critical: '严重', high: '高', medium: '中', low: '低' }
@@ -27,6 +30,18 @@ const EVT = { accepted: '接单', arrived: '到场', repaired: '修复', review_
 
 const kpi = computed(() => overview.value?.kpi || {})
 const openAlerts = computed(() => alerts.value.filter(a => a.status !== 'recovered'))
+const pageCount = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
+
+// 30 天趋势缩略图：把每天的数量映射成一条折线
+const spark = computed(() => {
+  const points = overview.value?.trend || []
+  if (points.length < 2) return null
+  const w = 120, h = 30, pad = 3
+  const max = Math.max(1, ...points.map(p => p.count))
+  const step = (w - pad * 2) / (points.length - 1)
+  const coords = points.map((p, i) => [pad + i * step, h - pad - (p.count / max) * (h - pad * 2)])
+  return { w, h, line: coords.map((c, i) => (i ? 'L' : 'M') + c[0].toFixed(1) + ',' + c[1].toFixed(1)).join(' ') }
+})
 
 function hm(value) {
   if (!value) return '—'
@@ -43,18 +58,36 @@ function duration(value) {
   return Math.floor(seconds / 86400) + ' 天'
 }
 
+async function loadAlerts() {
+  const result = await listAlerts({ page: page.value, page_size: pageSize })
+  alerts.value = result.items || []
+  total.value = result.total || 0
+}
+
 async function load() {
   loading.value = true
   error.value = ''
   try {
-    const [overviewData, alertPage, incidentList] = await Promise.all([
+    const [overviewData, incidentList] = await Promise.all([
       getOverview(),
-      listAlerts({ page: 1, page_size: 50 }),
       listIncidents(),
+      loadAlerts(),
     ])
     overview.value = overviewData
-    alerts.value = alertPage.items || []
     incidents.value = incidentList || []
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    loading.value = false
+  }
+}
+
+async function goto(nextPage) {
+  if (nextPage < 1 || nextPage > pageCount.value) return
+  page.value = nextPage
+  loading.value = true
+  try {
+    await loadAlerts()
   } catch (e) {
     error.value = e.message
   } finally {
@@ -67,8 +100,8 @@ async function openAlert(alert) {
   orders.value = []
   events.value = {}
   try {
-    const page = await listWorkOrders({ alert_id: alert.alert_id, page: 1, page_size: 20 })
-    orders.value = page.items || []
+    const result = await listWorkOrders({ alert_id: alert.alert_id, page: 1, page_size: 20 })
+    orders.value = result.items || []
   } catch (e) {
     error.value = e.message
   }
@@ -159,14 +192,20 @@ onUnmounted(() => clearInterval(timer))
 
     <div class="mt-grid">
       <section class="panel">
-        <h2>最近告警 <small>共 {{ alerts.length }} 条，未恢复 {{ openAlerts.length }} 条</small></h2>
+        <h2>
+          最近告警
+          <small>共 {{ total }} 条，未恢复 {{ openAlerts.length }} 条</small>
+          <svg v-if="spark" class="mt-spark" :viewBox="`0 0 ${spark.w} ${spark.h}`" aria-label="30 天告警趋势">
+            <path :d="spark.line" fill="none" stroke="#10a37f" stroke-width="1.6" stroke-linejoin="round" />
+          </svg>
+        </h2>
         <div class="table-scroll">
           <table>
             <thead><tr><th>等级</th><th>桩 / 枪</th><th>告警码</th><th>状态</th><th>发生时间</th><th>已持续</th></tr></thead>
             <tbody>
               <tr v-if="loading"><td colspan="6" class="empty">正在加载…</td></tr>
               <tr v-else-if="!alerts.length"><td colspan="6" class="empty">暂无告警</td></tr>
-              <tr v-for="alert in alerts.slice(0, 12)" :key="alert.alert_id" class="clickable" @click="openAlert(alert)">
+              <tr v-for="alert in alerts" :key="alert.alert_id" class="clickable" @click="openAlert(alert)">
                 <td><span class="badge mt-level" :class="alert.severity">{{ LEVEL[alert.severity] || alert.severity }}</span></td>
                 <td>#{{ alert.pile_id }}<span v-if="alert.gun_id"> / 枪 {{ alert.gun_id }}</span></td>
                 <td>{{ alert.alert_code }}</td>
@@ -176,6 +215,11 @@ onUnmounted(() => clearInterval(timer))
               </tr>
             </tbody>
           </table>
+        </div>
+        <div class="mt-pager">
+          <button :disabled="page <= 1 || loading" @click="goto(page - 1)">上一页</button>
+          <span>第 {{ page }} / {{ pageCount }} 页</span>
+          <button :disabled="page >= pageCount || loading" @click="goto(page + 1)">下一页</button>
         </div>
       </section>
 
@@ -234,7 +278,9 @@ onUnmounted(() => clearInterval(timer))
 .mt-kpi.blue { border-left-color: #2f6fed; } .mt-kpi.grey { border-left-color: #9aa8b5; }
 .mt-kpi span { font-size: 12.5px; color: #6b7c8c; } .mt-kpi b { display: block; font-size: 26px; margin-top: 4px; }
 .mt-grid { display: grid; grid-template-columns: 1.6fr 1fr; gap: 16px; align-items: start; }
-.mt-grid h2 small { color: #6b7c8c; font-weight: 400; margin-left: 8px; }
+.mt-grid h2 { display: flex; align-items: center; gap: 8px; }
+.mt-grid h2 small { color: #6b7c8c; font-weight: 400; }
+.mt-spark { margin-left: auto; width: 120px; height: 30px; }
 .clickable { cursor: pointer; }
 .clickable:hover { background: #f7fbfa; }
 .mt-level.critical { background: #fdeaea; color: #d64545; }
@@ -246,6 +292,7 @@ onUnmounted(() => clearInterval(timer))
 .mt-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
 .mt-title { font-size: 13px; margin-top: 4px; }
 .mt-meta { font-size: 12px; color: #6b7c8c; margin-top: 4px; }
+.mt-pager { display: flex; justify-content: flex-end; align-items: center; gap: 10px; margin-top: 12px; font-size: 12.5px; color: #6b7c8c; }
 .mt-detail h2 { font-size: 16px; }
 .mt-order { border: 1px solid #e6ebf0; border-radius: 10px; padding: 12px; margin-top: 12px; }
 .mt-row-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
