@@ -1080,3 +1080,46 @@ def test_occupied_without_order_notifies(db):
         db.execute(text("update charging_pile set status = :s where pile_id = :p"),
                    {"s": original, "p": pile_id})
         db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 31. 批量任务：单条失败不影响其他条目
+# ---------------------------------------------------------------------------
+def test_task_item_failure_does_not_abort_batch(db, monkeypatch):
+    from app.modules.maintenance import models as m
+
+    db.execute(text("delete from device_alert where alert_code = 'T-ISO'"))
+    db.commit()
+    alerts = []
+    for pile_id in (4, 5):
+        row = m.DeviceAlert(
+            pile_id=pile_id, gun_id=None, alarm_rule_id=901, alert_code="T-ISO",
+            severity="critical", occurred_at=utcnow(), status="open",
+            response_seconds_snapshot=300,
+        )
+        db.add(row)
+        alerts.append(row)
+    db.commit()
+
+    original = service.dao.create_work_order
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("模拟第一条写入失败")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service.dao, "create_work_order", flaky)
+    try:
+        affected = service.auto_dispatch_safety_alerts(db)
+        assert affected == 1, "失败的那条应被跳过，另一条仍要派单"
+        created = db.execute(text(
+            "select count(*) from work_order where alert_id in (:a, :b)"
+        ), {"a": alerts[0].alert_id, "b": alerts[1].alert_id}).scalar_one()
+        assert created == 1
+    finally:
+        _cleanup_alert_chain(db, [a.alert_id for a in alerts])
+        db.execute(text("update charging_pile set status='idle', has_fault=0 where pile_id in (4,5)"))
+        db.execute(text("delete from device_status_log where pile_id in (4,5) and reason like 'critical alert%'"))
+        db.commit()

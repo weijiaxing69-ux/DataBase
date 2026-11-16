@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -32,6 +34,8 @@ EVENT_TRANSITIONS: dict[str, tuple[str, str]] = {
     "closed": ("repaired", "closed"),
 }
 
+logger = logging.getLogger("maintenance.task")
+
 OFFLINE_RULE_METRIC = "heartbeat"
 DEFAULT_OFFLINE_SECONDS = 180
 BATCH_SIZE = 500
@@ -53,6 +57,17 @@ PERM_INCIDENT = "maintenance.incident.manage"
 def utcnow() -> datetime:
     """库内统一 UTC 的 naive datetime。"""
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _isolate(db: Session, label: str, action) -> bool:
+    """单条失败只回滚该条，不影响整批任务。"""
+    try:
+        with db.begin_nested():
+            action()
+        return True
+    except Exception:
+        logger.exception("task item failed: %s", label)
+        return False
 
 
 @contextmanager
@@ -487,7 +502,7 @@ def check_offline_devices(db: Session, *, now: Optional[datetime] = None, batch:
     threshold = _offline_threshold(db)
     count = 0
     with _tx(db):
-        for pile in dao.list_offline_candidates(db, now - timedelta(seconds=threshold), batch):
+        def mark(pile):
             old = pile.status
             pile.is_online = 0
             pile.status = "offline"          # fault 事实保留在 has_fault
@@ -495,7 +510,9 @@ def check_offline_devices(db: Session, *, now: Optional[datetime] = None, batch:
                 db, pile_id=pile.pile_id, old_status=old, new_status="offline",
                 occurred_at=now, reason=f"heartbeat timeout > {threshold}s",
             )
-            count += 1
+
+        for pile in dao.list_offline_candidates(db, now - timedelta(seconds=threshold), batch):
+            count += _isolate(db, f"offline:{pile.pile_id}", lambda p=pile: mark(p))
         db.flush()
     return count
 
@@ -518,7 +535,7 @@ def check_overdue_work_orders(db: Session, *, now: Optional[datetime] = None, ba
     now = now or utcnow()
     count = 0
     with _tx(db):
-        for wo in dao.list_overdue_work_orders(db, now, batch):
+        def escalate(wo):
             wo.escalation_level += 1
             dao.add_event(
                 db, work_order_id=wo.work_order_id, event_type="escalated", event_at=now,
@@ -535,7 +552,9 @@ def check_overdue_work_orders(db: Session, *, now: Optional[datetime] = None, ba
                 content=f"工单 {wo.work_order_id} 已超过响应时限，已升级到 L{wo.escalation_level}",
                 target_path=f"/maintenance/work-orders/{wo.work_order_id}",
             )
-            count += 1
+
+        for wo in dao.list_overdue_work_orders(db, now, batch):
+            count += _isolate(db, f"overdue:{wo.work_order_id}", lambda o=wo: escalate(o))
         db.flush()
     return count
 
@@ -591,7 +610,11 @@ def run_task(db: Session, *, actor: Actor, name: str) -> dict:
     if fn is None:
         raise ValueError(f"未知任务：{name}，可选 offline / overdue")
     now = utcnow()
+    started = time.perf_counter()
     affected = fn(db, now=now)
+    logger.info(
+        "task=%s affected=%s cost=%.0fms", name, affected, (time.perf_counter() - started) * 1000
+    )
     return {"task": name, "affected": affected, "ran_at": now.isoformat(timespec="seconds")}
 
 
@@ -690,10 +713,10 @@ def auto_dispatch_safety_alerts(db: Session, *, now: Optional[datetime] = None, 
     now = now or utcnow()
     count = 0
     with _tx(db):
-        for alert in dao.list_critical_alerts_without_order(db, batch):
+        def dispatch(alert):
             pile = dao.get_pile(db, alert.pile_id, for_update=True)
             if pile is None:
-                continue
+                return
             if pile.status != "fault":
                 dao.log_status(
                     db, pile_id=pile.pile_id, old_status=pile.status, new_status="fault",
@@ -714,7 +737,9 @@ def auto_dispatch_safety_alerts(db: Session, *, now: Optional[datetime] = None, 
                 response_due_at=now + timedelta(seconds=alert.response_seconds_snapshot),
             )
             alert.status = "processing"
-            count += 1
+
+        for alert in dao.list_critical_alerts_without_order(db, batch):
+            count += _isolate(db, f"safety:{alert.alert_id}", lambda a=alert: dispatch(a))
         db.flush()
     return count
 
