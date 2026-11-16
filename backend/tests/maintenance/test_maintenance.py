@@ -586,6 +586,11 @@ def test_kpi_respects_scope(db):
 def test_part_usage_deducts_stock(db):
     from app.modules.maintenance import models as m
 
+    pile_id = 7
+    alert_id, sampled_at, device = _make_alert(db, pile_id)
+    wo = service.create_work_order(
+        db, actor=ADMIN, alert_id=alert_id, request=s.CreateWorkOrderRequest(assigned_to=102)
+    )
     db.execute(text("delete from spare_part where part_code = 'T-PART-001'"))
     db.commit()
     part = m.SparePart(part_code="T-PART-001", part_name="测试备件", unit="个",
@@ -596,21 +601,26 @@ def test_part_usage_deducts_stock(db):
         with pytest.raises(BusinessError) as err:
             service.create_part_usage(
                 db, actor=ADMIN,
-                request=s.CreatePartUsageRequest(work_order_id=901, part_id=part.part_id, qty=2),
+                request=s.CreatePartUsageRequest(work_order_id=wo.work_order_id,
+                                                 part_id=part.part_id, qty=2),
             )
         assert err.value.status_code == 409
 
         usage = service.create_part_usage(
             db, actor=ADMIN,
-            request=s.CreatePartUsageRequest(work_order_id=901, part_id=part.part_id, qty=1),
+            request=s.CreatePartUsageRequest(work_order_id=wo.work_order_id,
+                                             part_id=part.part_id, qty=1),
         )
         assert usage.qty == 1
-        stock = db.execute(text("select stock_qty from spare_part where part_id = :p"),
-                           {"p": part.part_id}).scalar_one()
-        assert stock == 0
+        assert db.execute(text("select stock_qty from spare_part where part_id = :p"),
+                          {"p": part.part_id}).scalar_one() == 0
     finally:
         db.execute(text("delete from part_usage where part_id = :p"), {"p": part.part_id})
         db.execute(text("delete from spare_part where part_id = :p"), {"p": part.part_id})
+        _cleanup_alert_chain(db, [alert_id])
+        db.execute(text("delete from device_reading where pile_id = :p and sampled_at = :t"),
+                   {"p": pile_id, "t": sampled_at})
+        _drop_credential(db, device)
         db.commit()
 
 
@@ -623,3 +633,157 @@ def test_fault_report_linked_requires_alert(db):
             db, actor=ADMIN, report_id=901,
             request=s.HandleFaultReportRequest(status="linked", alert_id=None),
         )
+
+
+# ---------------------------------------------------------------------------
+# 18. 离线恢复：订单仍在充电时不能置空闲
+# ---------------------------------------------------------------------------
+def test_recovery_keeps_occupied_when_charging(db, monkeypatch):
+    pile_id = 9
+    token, device = _issue_credential(db, pile_id)
+    original = db.execute(text("select status, is_online from charging_pile where pile_id = :p"),
+                          {"p": pile_id}).one()
+    try:
+        db.execute(text(
+            "update charging_pile set is_online = 1, status = 'offline', has_fault = 0, "
+            "last_heartbeat_at = :t where pile_id = :p"
+        ), {"t": utcnow() - timedelta(hours=1), "p": pile_id})
+        db.commit()
+
+        monkeypatch.setattr(service.dao, "pile_has_active_order", lambda *a, **k: True)
+        ack = service.receive_heartbeat(
+            db, device=device, request=s.HeartbeatRequest(pile_id=pile_id)
+        )
+        assert ack.is_online == 1
+        assert db.execute(text("select status from charging_pile where pile_id = :p"),
+                          {"p": pile_id}).scalar_one() == "occupied"
+    finally:
+        db.execute(text("update charging_pile set status = :s, is_online = :o where pile_id = :p"),
+                   {"s": original[0], "o": original[1], "p": pile_id})
+        _drop_credential(db, device)
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 19. 备件领用：闭环工单、跨场站都拒绝
+# ---------------------------------------------------------------------------
+def test_part_usage_rejects_closed_order_and_cross_station(db):
+    from app.modules.maintenance import models as m
+
+    pile_id = 6
+    alert_id, sampled_at, device = _make_alert(db, pile_id)
+    wo = service.create_work_order(
+        db, actor=ADMIN, alert_id=alert_id, request=s.CreateWorkOrderRequest(assigned_to=102)
+    )
+    wo_station = db.execute(text(
+        "select p.station_id from work_order w join device_alert a on a.alert_id = w.alert_id "
+        "join charging_pile p on p.pile_id = a.pile_id where w.work_order_id = :w"
+    ), {"w": wo.work_order_id}).scalar_one()
+    other_station = 1 if wo_station != 1 else 2
+
+    db.execute(text("delete from spare_part where part_code in ('T-PART-002','T-PART-003')"))
+    db.commit()
+    central = m.SparePart(part_code="T-PART-002", part_name="测试备件2", unit="个",
+                          station_id=None, stock_qty=5, safety_stock=0, status="active")
+    cross = m.SparePart(part_code="T-PART-003", part_name="测试备件3", unit="个",
+                        station_id=other_station, stock_qty=5, safety_stock=0, status="active")
+    db.add_all([central, cross])
+    db.commit()
+    try:
+        # 跨场站：备件在场站 other_station，工单在 wo_station
+        with pytest.raises(BusinessError) as cross_err:
+            service.create_part_usage(
+                db, actor=ADMIN,
+                request=s.CreatePartUsageRequest(work_order_id=wo.work_order_id,
+                                                 part_id=cross.part_id, qty=1),
+            )
+        assert cross_err.value.status_code == 409
+
+        # 闭环后不允许再领用
+        db.execute(text("update work_order set status = 'accepted' where work_order_id = :w"),
+                   {"w": wo.work_order_id})
+        db.execute(text("update work_order set status = 'arrived' where work_order_id = :w"),
+                   {"w": wo.work_order_id})
+        db.execute(text("update work_order set status = 'repaired' where work_order_id = :w"),
+                   {"w": wo.work_order_id})
+        db.execute(text("update work_order set status = 'closed' where work_order_id = :w"),
+                   {"w": wo.work_order_id})
+        db.commit()
+        with pytest.raises(BusinessError) as closed_err:
+            service.create_part_usage(
+                db, actor=ADMIN,
+                request=s.CreatePartUsageRequest(work_order_id=wo.work_order_id,
+                                                 part_id=central.part_id, qty=1),
+            )
+        assert closed_err.value.status_code == 409
+    finally:
+        db.execute(text("delete from part_usage where part_id in (:a, :b)"),
+                   {"a": central.part_id, "b": cross.part_id})
+        db.execute(text("delete from spare_part where part_code in ('T-PART-002','T-PART-003')"))
+        _cleanup_alert_chain(db, [alert_id])
+        db.execute(text("delete from device_reading where pile_id = :p and sampled_at = :t"),
+                   {"p": pile_id, "t": sampled_at})
+        _drop_credential(db, device)
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 20. 事件声明：跨场站事件必须落在账号授权的运营商内
+# ---------------------------------------------------------------------------
+def test_declare_incident_requires_operator_scope(db):
+    from app.modules.maintenance import emergency
+
+    outsider = Actor(
+        account_id=999,
+        roles=frozenset({"maintenance_engineer"}),
+        permissions=frozenset({"maintenance.incident.manage"}),
+    )
+    with pytest.raises(PermissionError):
+        emergency.declare_incident(
+            db, actor=outsider, operator_id=1, station_id=None,
+            category="power", severity="P2", title="越权声明测试",
+        )
+
+
+# ---------------------------------------------------------------------------
+# 21. 并发接单：行锁保证只有一方成功
+# ---------------------------------------------------------------------------
+def test_concurrent_accept_only_one_wins(db):
+    import threading
+
+    from app.core.database import SessionLocal
+
+    pile_id = 8
+    alert_id, sampled_at, device = _make_alert(db, pile_id)
+    wo = service.create_work_order(
+        db, actor=ADMIN, alert_id=alert_id, request=s.CreateWorkOrderRequest(assigned_to=102)
+    )
+    barrier = threading.Barrier(2)
+    results: list[str] = []
+
+    def worker():
+        session = SessionLocal()
+        try:
+            barrier.wait(timeout=5)
+            service.append_work_order_event(
+                session, actor=ENGINEER, work_order_id=wo.work_order_id,
+                request=s.WorkOrderEventRequest(event_type="accepted"),
+            )
+            results.append("ok")
+        except BusinessError:
+            results.append("blocked")
+        finally:
+            session.close()
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+
+    assert sorted(results) == ["blocked", "ok"]
+    _cleanup_alert_chain(db, [alert_id])
+    db.execute(text("delete from device_reading where pile_id = :p and sampled_at = :t"),
+               {"p": pile_id, "t": sampled_at})
+    _drop_credential(db, device)
+    db.commit()

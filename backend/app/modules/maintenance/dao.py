@@ -426,9 +426,11 @@ def kpi_counts(db: Session, account_id: Optional[int] = None) -> dict:
     alert_scope = _scope("a.pile_id", account_id)
     order_scope = _scope("(select da.pile_id from device_alert da where da.alert_id = w.alert_id)", account_id)
     incident_scope = "1=1" if account_id is None else (
-        "exists (select 1 from station st where st.station_id = i.station_id and ("
+        "(exists (select 1 from station st where st.station_id = i.station_id and ("
         "st.station_id in (select station_id from sys_account_station where account_id = :aid) "
-        "or st.operator_id in (select operator_id from sys_account_operator where account_id = :aid)))"
+        "or st.operator_id in (select operator_id from sys_account_operator where account_id = :aid))) "
+        "or (i.station_id is null and i.operator_id in "
+        "(select operator_id from sys_account_operator where account_id = :aid)))"
     )
     row = db.execute(
         text(
@@ -513,9 +515,13 @@ def list_spare_parts(db: Session, q: s.PartQuery, *, account_id: Optional[int] =
         stmt = stmt.where(
             m.SparePart.station_id.is_(None)
             | m.SparePart.station_id.in_(
-                text("select station_id from sys_account_station where account_id = :aid").bindparams(
-                    aid=account_id
-                )
+                text(
+                    """select station_id from sys_account_station where account_id = :aid
+                       union
+                       select s.station_id from station s
+                         join sys_account_operator ao on ao.operator_id = s.operator_id
+                        where ao.account_id = :aid"""
+                ).bindparams(aid=account_id)
             )
         )
     stmt = stmt.order_by(m.SparePart.part_id)
@@ -582,4 +588,24 @@ def list_recovering_alerts(db: Session, limit: int):
             .limit(limit)
             .with_for_update(skip_locked=True)
         ).scalars()
+    )
+
+
+def pile_has_active_order(db: Session, pile_id: int) -> bool:
+    return db.execute(
+        text(
+            """select count(*) from charging_order o
+                 join charging_gun g on g.gun_id = o.gun_id
+                where g.pile_id = :p and o.status = 'charging'"""
+        ),
+        {"p": pile_id},
+    ).scalar_one() > 0
+
+
+def account_operators(db: Session, account_id: int) -> set[int]:
+    return set(
+        db.execute(
+            text("select operator_id from sys_account_operator where account_id = :aid"),
+            {"aid": account_id},
+        ).scalars().all()
     )

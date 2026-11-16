@@ -359,7 +359,12 @@ def receive_heartbeat(db: Session, *, device: DeviceActor, request: s.HeartbeatR
         pile.last_heartbeat_at = now
         pile.is_online = 1
         if old_status == "offline":
-            new_status = "fault" if pile.has_fault else "idle"
+            if pile.has_fault:
+                new_status = "fault"
+            elif dao.pile_has_active_order(db, pile.pile_id):
+                new_status = "occupied"   # 离线期间订单仍在进行，恢复后不能置空闲
+            else:
+                new_status = "idle"
             pile.status = new_status
             dao.log_status(
                 db, pile_id=pile.pile_id, old_status=old_status, new_status=new_status,
@@ -623,11 +628,16 @@ def create_part_usage(db: Session, *, actor: Actor, request: s.CreatePartUsageRe
         alert = dao.get_alert(db, wo.alert_id)
         if alert is not None:
             _scope_pile(db, actor, alert.pile_id)
+        if wo.status == "closed":
+            raise BusinessError("工单已闭环，不能再领用备件", status_code=409)
         part = dao.get_spare_part(db, request.part_id, for_update=True)
         if part is None:
             raise BusinessError("备件不存在", status_code=404)
         if part.station_id is not None:
             security.assert_resource_scope(db, actor, resource_type="station", resource_id=part.station_id)
+            wo_station = _station_of_work_order(db, wo)
+            if wo_station is not None and part.station_id != wo_station:
+                raise BusinessError("备件所属场站与工单不一致，不能跨站领用", status_code=409)
         try:
             row = dao.create_part_usage(
                 db,

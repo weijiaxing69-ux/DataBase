@@ -12,6 +12,7 @@ from typing import Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.core import security
 from app.core.errors import BusinessError
 from app.modules.maintenance.service import (
     PERM_ALERT_READ,
@@ -40,6 +41,13 @@ def declare_incident(
         raise ValueError("根因类别不合法")
     if severity not in {"P1", "P2", "P3", "P4"}:
         raise ValueError("事件级别不合法")
+    # 跨场站事件按运营商授权校验；单场站事件按场站授权校验
+    if station_id is not None:
+        security.assert_resource_scope(db, actor, resource_type="station", resource_id=station_id)
+    elif "platform_admin" not in actor.roles:
+        from app.modules.maintenance import dao
+        if operator_id not in dao.account_operators(db, actor.account_id):
+            raise PermissionError("该运营商超出账号授权范围")
     with _tx(db):
         db.execute(
             text(
