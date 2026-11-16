@@ -609,3 +609,123 @@ def account_operators(db: Session, account_id: int) -> set[int]:
             {"aid": account_id},
         ).scalars().all()
     )
+
+
+# ---------------------------------------------------------------------------
+# 现场问题识别（充电异常、安全停机、复发故障）
+# ---------------------------------------------------------------------------
+def rule_by_fault_code(db: Session, fault_code: str):
+    return db.execute(
+        select(m.AlarmRule).where(
+            m.AlarmRule.fault_code == fault_code, m.AlarmRule.enabled == 1
+        ).order_by(m.AlarmRule.alarm_rule_id).limit(1)
+    ).scalar_one_or_none()
+
+
+def insert_alert(
+    db: Session, *, pile_id: int, gun_id: Optional[int], rule,
+    alert_code: str, occurred_at,
+) -> bool:
+    """插入告警；同桩同码已有未恢复记录时靠唯一键跳过，返回是否真的插入。"""
+    result = db.execute(
+        text(
+            """insert ignore into device_alert
+                 (pile_id, gun_id, alarm_rule_id, alert_code, severity,
+                  occurred_at, status, response_seconds_snapshot)
+               values (:pile, :gun, :rule, :code, :sev, :at, 'open', :snap)"""
+        ),
+        {
+            "pile": pile_id, "gun": gun_id, "rule": rule.alarm_rule_id,
+            "code": alert_code, "sev": rule.severity, "at": occurred_at,
+            "snap": rule.response_seconds,
+        },
+    )
+    return result.rowcount > 0
+
+
+def list_charging_anomalies(db: Session, since, threshold_kw: float, min_samples: int):
+    rows = db.execute(
+        text(
+            """select o.order_id, o.gun_id, g.pile_id,
+                      count(r.sample_id) as samples, max(r.power_kw) as max_power
+                 from charging_order o
+                 join charging_gun g on g.gun_id = o.gun_id
+                 join device_reading r on r.pile_id = g.pile_id and r.sampled_at >= :since
+                where o.status = 'charging'
+                group by o.order_id, o.gun_id, g.pile_id
+               having count(r.sample_id) >= :min_samples and max(r.power_kw) < :threshold"""
+        ),
+        {"since": since, "threshold": threshold_kw, "min_samples": min_samples},
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def list_critical_alerts_without_order(db: Session, limit: int):
+    return list(
+        db.execute(
+            select(m.DeviceAlert)
+            .join(m.AlarmRule, m.AlarmRule.alarm_rule_id == m.DeviceAlert.alarm_rule_id)
+            .where(
+                m.AlarmRule.severity == "critical",
+                m.DeviceAlert.status.in_(("open", "processing")),
+                ~select(m.WorkOrder.work_order_id)
+                .where(m.WorkOrder.alert_id == m.DeviceAlert.alert_id)
+                .exists(),
+            )
+            .order_by(m.DeviceAlert.occurred_at)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        ).scalars()
+    )
+
+
+def on_call_accounts(db: Session, station_id: Optional[int], now):
+    """当前值班（主/备主管）；过了班次就取最近一次排班的负责人。"""
+    sql_current = text(
+        """select primary_account_id, coalesce(supervisor_account_id, primary_account_id) as supervisor
+             from on_call_shift
+            where scope_type = 'station' and scope_id = :sid
+              and shift_start <= :now and shift_end > :now
+            limit 1"""
+    )
+    sql_latest = text(
+        """select primary_account_id, coalesce(supervisor_account_id, primary_account_id) as supervisor
+             from on_call_shift
+            where scope_type = 'station' and scope_id = :sid
+            order by shift_end desc limit 1"""
+    )
+    params = {"sid": station_id, "now": now}
+    row = db.execute(sql_current, params).one_or_none() if station_id else None
+    if row is None and station_id is not None:
+        row = db.execute(sql_latest, params).one_or_none()
+    if row is None:
+        return 101, 101   # 兜底：平台管理员
+    return int(row[0]), int(row[1])
+
+
+def list_recurring_faults(db: Session, since, threshold: int):
+    rows = db.execute(
+        text(
+            """select pile_id, alert_code, count(*) as times
+                 from device_alert
+                where occurred_at >= :since
+                group by pile_id, alert_code
+               having count(*) >= :threshold
+                order by times desc"""
+        ),
+        {"since": since, "threshold": threshold},
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def set_gun_status(db: Session, gun_id: int, status: str) -> None:
+    db.execute(text("update charging_gun set status = :s where gun_id = :g"),
+               {"s": status, "g": gun_id})
+
+
+def open_work_order_for_alert(db: Session, alert_id: int):
+    return db.execute(
+        select(m.WorkOrder).where(
+            m.WorkOrder.alert_id == alert_id, m.WorkOrder.status != "closed"
+        ).order_by(m.WorkOrder.work_order_id.desc()).limit(1)
+    ).scalar_one_or_none()

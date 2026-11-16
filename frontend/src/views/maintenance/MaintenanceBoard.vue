@@ -21,6 +21,7 @@ const page = ref(1)
 const pageSize = 8
 const total = ref(0)
 const updatedAt = ref('')
+const taskName = ref('offline')
 let timer = null
 let toastTimer = null
 
@@ -178,7 +179,9 @@ async function triggerTask(name) {
   busy.value = true
   try {
     const result = await runTask(name)
-    showToast(`${name === 'offline' ? '离线扫描' : '超时升级'}完成，影响 ${result.affected} 条`)
+    const label = { offline: '离线扫描', overdue: '超时升级', recovery: '恢复推进',
+                    charging: '充电中断', safety: '安全停机', recurring: '复发升级' }[name] || name
+    showToast(`${label}完成，影响 ${result.affected} 条`)
     await load()
   } catch (e) {
     error.value = e.message
@@ -209,13 +212,17 @@ onUnmounted(() => {
       </div>
       <div class="mt-actions">
         <span class="mt-live"><i></i>数据已连接</span>
-        <button class="mt-ghost" :disabled="busy" @click="triggerTask('offline')">
-          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 2v5l3 2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
-          离线扫描
-        </button>
-        <button class="mt-ghost" :disabled="busy" @click="triggerTask('overdue')">
-          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 11V5m0-3 4.5 11h-9L8 2Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
-          超时升级
+        <select v-model="taskName" class="mt-select" aria-label="选择扫描任务">
+          <option value="offline">离线扫描</option>
+          <option value="overdue">超时升级</option>
+          <option value="recovery">恢复推进</option>
+          <option value="charging">充电中断</option>
+          <option value="safety">安全停机派单</option>
+          <option value="recurring">复发故障升级</option>
+        </select>
+        <button class="mt-ghost" :disabled="busy" @click="triggerTask(taskName)">
+          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M3 8h10M9 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          执行扫描
         </button>
         <button class="primary" :disabled="loading" @click="load">
           <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M13 8a5 5 0 1 1-1.5-3.5M13 2v3h-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
@@ -444,6 +451,9 @@ onUnmounted(() => {
 .mt-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .mt-live { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: #2c6a50;
   background: #eaf4ed; border: 1px solid #cfe6d6; padding: 7px 12px; border-radius: 999px; }
+.mt-select { font-size: 13px; padding: 7px 10px; border: 1px solid #d8e2dc; border-radius: 8px;
+  background: #fff; color: #344e41; }
+.mt-select:focus-visible { outline: 3px solid #9acaaf; outline-offset: 2px; }
 .mt-live i { width: 6px; height: 6px; border-radius: 50%; background: #4f9c72; box-shadow: 0 0 0 3px #d9ecdf; }
 .mt-ghost { display: inline-flex; align-items: center; gap: 6px; background: #fff; border: 1px solid #d8e2dc; color: #344e41; }
 .mt-ghost:hover { background: #f3f8f4; border-color: #bcd4c4; }

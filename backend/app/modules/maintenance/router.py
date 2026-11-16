@@ -351,12 +351,12 @@ def stats_overview(db: Database, actor: CurrentActor):
 @router.post(
     "/tasks/{name}/run",
     summary="手动触发一次后台任务",
-    description="name 取 offline（心跳超时置离线）或 overdue（超时未接单升级）。",
+    description="offline 心跳超时置离线；overdue 超时未接单升级；recovery 推进告警恢复；charging 识别充电中断；safety 严重告警自动停机派单；recurring 复发故障升级。",
 )
 def run_task(
     db: Database,
     actor: CurrentActor,
-    name: Annotated[str, Path(pattern="^(offline|overdue|recovery)$")],
+    name: Annotated[str, Path(pattern="^(offline|overdue|recovery|charging|safety|recurring)$")],
 ):
     return service.run_task(db, actor=actor, name=name)
 

@@ -583,13 +583,6 @@ def check_alert_recovery(db: Session, *, now: Optional[datetime] = None, batch: 
     return changed
 
 
-TASKS = {
-    "offline": check_offline_devices,
-    "overdue": check_overdue_work_orders,
-    "recovery": check_alert_recovery,
-}
-
-
 def run_task(db: Session, *, actor: Actor, name: str) -> dict:
     """手动触发一次后台任务，用于演示与排查；生产由调度器调用。"""
     if "platform_admin" not in actor.roles:
@@ -663,3 +656,115 @@ def list_part_usages(db: Session, *, actor: Actor, work_order_id: int):
     if alert is not None:
         _scope_pile(db, actor, alert.pile_id)
     return [s.PartUsageDetail.model_validate(r) for r in dao.list_part_usages(db, work_order_id)]
+
+
+# ---------------------------------------------------------------------------
+# 现场问题识别（对应真实充电场景）
+# ---------------------------------------------------------------------------
+def check_charging_anomaly(
+    db: Session, *, now: Optional[datetime] = None,
+    window_minutes: int = 6, threshold_kw: float = 1.0, min_samples: int = 2,
+) -> int:
+    """订单在充电中但桩输出功率持续接近 0（跳枪、枪锁松脱、BMS 中断）。"""
+    now = now or utcnow()
+    rule = dao.rule_by_fault_code(db, "CHG01")
+    if rule is None:
+        return 0
+    created = 0
+    with _tx(db):
+        rows = dao.list_charging_anomalies(
+            db, now - timedelta(minutes=window_minutes), threshold_kw, min_samples
+        )
+        for row in rows:
+            if dao.insert_alert(
+                db, pile_id=row["pile_id"], gun_id=row["gun_id"],
+                rule=rule, alert_code="CHG01", occurred_at=now,
+            ):
+                created += 1
+        db.flush()
+    return created
+
+
+def auto_dispatch_safety_alerts(db: Session, *, now: Optional[datetime] = None, batch: int = 50) -> int:
+    """严重级告警自动停机并派单：现场标准处置，先停用再派人。"""
+    now = now or utcnow()
+    count = 0
+    with _tx(db):
+        for alert in dao.list_critical_alerts_without_order(db, batch):
+            pile = dao.get_pile(db, alert.pile_id, for_update=True)
+            if pile is None:
+                continue
+            if pile.status != "fault":
+                dao.log_status(
+                    db, pile_id=pile.pile_id, old_status=pile.status, new_status="fault",
+                    occurred_at=now, reason=f"critical alert {alert.alert_code}",
+                )
+                pile.status = "fault"
+            pile.has_fault = 1
+            if alert.gun_id:
+                dao.set_gun_status(db, alert.gun_id, "fault")
+
+            primary, supervisor = dao.on_call_accounts(db, pile.station_id, now)
+            dao.create_work_order(
+                db,
+                alert_id=alert.alert_id,
+                assigned_to=primary,
+                assigned_by=supervisor,
+                assigned_at=now,
+                response_due_at=now + timedelta(seconds=alert.response_seconds_snapshot),
+            )
+            alert.status = "processing"
+            count += 1
+        db.flush()
+    return count
+
+
+def escalate_recurring_faults(
+    db: Session, *, now: Optional[datetime] = None, days: int = 30, threshold: int = 3
+) -> int:
+    """同一根桩同一故障码反复发生，把在办工单升一级（修不好要换件/换桩）。"""
+    now = now or utcnow()
+    changed = 0
+    with _tx(db):
+        for row in dao.list_recurring_faults(db, now - timedelta(days=days), threshold):
+            latest = db.execute(
+                select(m.DeviceAlert)
+                .where(m.DeviceAlert.pile_id == row["pile_id"],
+                       m.DeviceAlert.alert_code == row["alert_code"])
+                .order_by(m.DeviceAlert.occurred_at.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if latest is None:
+                continue
+            wo = dao.open_work_order_for_alert(db, latest.alert_id)
+            if wo is None or wo.escalation_level >= 3:
+                continue
+
+            marker = f"复发第{row['times']}次"
+            exists = db.execute(
+                text("select count(*) from work_order_event where work_order_id = :w and note like :p"),
+                {"w": wo.work_order_id, "p": f"%{marker}%"},
+            ).scalar_one()
+            if exists:
+                continue
+
+            wo.escalation_level += 1
+            dao.add_event(
+                db, work_order_id=wo.work_order_id, event_type="escalated", event_at=now,
+                old_status=wo.status, new_status=wo.status, actor_account_id=None,
+                note=f"{marker}（{days} 天内同码告警），自动升级到 L{wo.escalation_level}",
+            )
+            changed += 1
+        db.flush()
+    return changed
+
+
+# 调度入口：任务名 -> 函数（放在文件末尾，避免前向引用）
+TASKS = {
+    "offline": check_offline_devices,
+    "overdue": check_overdue_work_orders,
+    "recovery": check_alert_recovery,
+    "charging": check_charging_anomaly,
+    "safety": auto_dispatch_safety_alerts,
+    "recurring": escalate_recurring_faults,
+}

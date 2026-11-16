@@ -787,3 +787,150 @@ def test_concurrent_accept_only_one_wins(db):
                {"p": pile_id, "t": sampled_at})
     _drop_credential(db, device)
     db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 22. 充电中断：订单在充但功率持续接近 0
+# ---------------------------------------------------------------------------
+def _make_charging_order(db, pile_id: int) -> int:
+    station_id = db.execute(text("select station_id from charging_pile where pile_id = :p"),
+                            {"p": pile_id}).scalar_one()
+    gun_id = db.execute(text("select gun_id from charging_gun where pile_id = :p order by gun_id limit 1"),
+                        {"p": pile_id}).scalar_one()
+    operator_id = db.execute(text("select operator_id from station where station_id = :s"),
+                             {"s": station_id}).scalar_one()
+    db.execute(text("delete from charging_order where gun_id = :g and status = 'charging'"), {"g": gun_id})
+    db.execute(text(
+        """insert into charging_order
+           (user_id, gun_id, rule_id, operator_id, station_id, order_mode, status, started_at)
+           values (1, :gun, 1, :op, :st, 'personal', 'charging', :t)"""
+    ), {"gun": gun_id, "op": operator_id, "st": station_id, "t": utcnow() - timedelta(minutes=10)})
+    db.commit()
+    return gun_id
+
+
+def test_charging_anomaly_creates_alert(db):
+    pile_id = 5
+    db.execute(text("delete from device_alert where alert_code = 'CHG01' and pile_id = :p"), {"p": pile_id})
+    db.commit()
+    gun_id = _make_charging_order(db, pile_id)
+    now = ms_now()
+    try:
+        for offset in (60, 120):
+            db.execute(text(
+                """insert into device_reading
+                   (pile_id, sampled_at, output_voltage_v, output_current_a, power_kw,
+                    module_temperature_c, offline_seconds, fault_code)
+                   values (:p, :t, 400, 0.5, 0.2, 36, 0, 'NONE')"""
+            ), {"p": pile_id, "t": now - timedelta(seconds=offset)})
+        db.commit()
+
+        assert service.check_charging_anomaly(db, now=now) >= 1
+        row = db.execute(text(
+            "select alert_id, severity, status from device_alert where alert_code = 'CHG01' and pile_id = :p"
+        ), {"p": pile_id}).one()
+        assert row[1] == "high" and row[2] == "open"
+
+        # 重复执行不应重复生成
+        assert service.check_charging_anomaly(db, now=now) == 0
+    finally:
+        _cleanup_alert_chain(db, [r[0] for r in db.execute(text(
+            "select alert_id from device_alert where alert_code = 'CHG01' and pile_id = :p"), {"p": pile_id})])
+        db.execute(text("delete from device_reading where pile_id = :p and sampled_at >= :t"),
+                   {"p": pile_id, "t": now - timedelta(minutes=10)})
+        db.execute(text("delete from charging_order where gun_id = :g and status = 'charging'"), {"g": gun_id})
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 23. 严重告警：自动停机 + 自动派单
+# ---------------------------------------------------------------------------
+def test_safety_alert_auto_dispatch(db):
+    from app.modules.maintenance import models as m
+
+    pile_id = 3
+    db.execute(text("delete from device_alert where alert_code = 'T-SAFE' and pile_id = :p"), {"p": pile_id})
+    db.commit()
+    original = db.execute(text("select status, has_fault from charging_pile where pile_id = :p"),
+                          {"p": pile_id}).one()
+    alert = m.DeviceAlert(
+        pile_id=pile_id, gun_id=None, alarm_rule_id=901, alert_code="T-SAFE",
+        severity="critical", occurred_at=utcnow(), status="open",
+        response_seconds_snapshot=300,
+    )
+    db.add(alert)
+    db.commit()
+    try:
+        assert service.auto_dispatch_safety_alerts(db) >= 1
+        pile = db.execute(text("select status, has_fault from charging_pile where pile_id = :p"),
+                          {"p": pile_id}).one()
+        assert pile[0] == "fault" and pile[1] == 1
+
+        wo = db.execute(text("select work_order_id, assigned_to, status from work_order where alert_id = :a"),
+                        {"a": alert.alert_id}).one()
+        assert wo[2] == "assigned"
+        assert db.execute(text("select status from device_alert where alert_id = :a"),
+                          {"a": alert.alert_id}).scalar_one() == "processing"
+
+        # 已有工单不再重复派
+        assert service.auto_dispatch_safety_alerts(db) == 0
+    finally:
+        _cleanup_alert_chain(db, [alert.alert_id])
+        db.execute(text("update charging_pile set status = :s, has_fault = :h where pile_id = :p"),
+                   {"s": original[0], "h": original[1], "p": pile_id})
+        db.execute(text(
+            "delete from device_status_log where pile_id = :p and reason like 'critical alert%'"
+        ), {"p": pile_id})
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 24. 复发故障：同一根桩同码 30 天内 ≥3 次，工单升级
+# ---------------------------------------------------------------------------
+def test_recurring_fault_escalates_work_order(db):
+    from app.modules.maintenance import models as m
+
+    pile_id = 2
+    db.execute(text(
+        "delete from work_order_event where work_order_id in "
+        "(select work_order_id from work_order where alert_id in "
+        "(select alert_id from device_alert where alert_code = 'T-RECUR'))"
+    ))
+    db.execute(text("delete from work_order where alert_id in "
+                    "(select alert_id from device_alert where alert_code = 'T-RECUR')"))
+    db.execute(text("delete from device_alert where alert_code = 'T-RECUR'"))
+    db.commit()
+
+    alerts = []
+    for days_ago in (3, 2, 1):
+        occurred = utcnow() - timedelta(days=days_ago)
+        # 历史告警置为已恢复，否则生成列唯一键会挡住同一桩同码的历史记录
+        row = m.DeviceAlert(
+            pile_id=pile_id, gun_id=None, alarm_rule_id=9, alert_code="T-RECUR",
+            severity="high", occurred_at=occurred,
+            status="recovered" if days_ago > 1 else "processing",
+            recovered_at=occurred + timedelta(minutes=30) if days_ago > 1 else None,
+            response_seconds_snapshot=600,
+        )
+        db.add(row)
+        alerts.append(row)
+    db.commit()
+    latest = alerts[-1]
+    wo = service.create_work_order(
+        db, actor=ADMIN, alert_id=latest.alert_id, request=s.CreateWorkOrderRequest(assigned_to=102)
+    )
+    try:
+        assert service.escalate_recurring_faults(db, now=utcnow()) >= 1
+        level = db.execute(text("select escalation_level from work_order where work_order_id = :w"),
+                           {"w": wo.work_order_id}).scalar_one()
+        assert level == 1
+        note = db.execute(text(
+            "select note from work_order_event where work_order_id = :w and event_type = 'escalated'"
+        ), {"w": wo.work_order_id}).scalar_one()
+        assert "复发第3次" in note
+
+        # 幂等：再跑一次不应重复升级
+        assert service.escalate_recurring_faults(db, now=utcnow()) == 0
+    finally:
+        _cleanup_alert_chain(db, [a.alert_id for a in alerts])
+        db.commit()
