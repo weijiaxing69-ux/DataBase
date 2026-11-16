@@ -851,3 +851,81 @@ def performance_stats(db: Session, *, actor: Actor):
 
 
 TASKS["inspection"] = check_inspection_due
+
+
+# ---------------------------------------------------------------------------
+# 高温预警、计量异常、充满占位
+# ---------------------------------------------------------------------------
+def check_temperature_warning(
+    db: Session, *, now: Optional[datetime] = None,
+    window_minutes: int = 15, threshold_c: float = 65.0, samples: int = 3,
+) -> int:
+    """连续多条采样温度超阈值，在报故障码之前先预警。"""
+    now = now or utcnow()
+    rule = dao.rule_by_fault_code(db, "TEMP01")
+    if rule is None:
+        return 0
+    created = 0
+    with _tx(db):
+        rows = dao.list_high_temperature_piles(
+            db, now - timedelta(minutes=window_minutes), threshold_c, samples
+        )
+        for row in rows:
+            if dao.insert_alert(
+                db, pile_id=row["pile_id"], gun_id=None, rule=rule,
+                alert_code="TEMP01", occurred_at=now,
+            ):
+                created += 1
+        db.flush()
+    return created
+
+
+def check_metering_anomaly(
+    db: Session, *, now: Optional[datetime] = None,
+    window_minutes: int = 15, amps: float = 1.0,
+) -> int:
+    """没有进行中订单却仍有输出电流：继电器粘连或计量漂移，按严重级处理。"""
+    now = now or utcnow()
+    rule = dao.rule_by_fault_code(db, "MET01")
+    if rule is None:
+        return 0
+    created = 0
+    with _tx(db):
+        rows = dao.list_metering_anomalies(db, now - timedelta(minutes=window_minutes), amps)
+        for row in rows:
+            if dao.insert_alert(
+                db, pile_id=row["pile_id"], gun_id=None, rule=rule,
+                alert_code="MET01", occurred_at=now,
+            ):
+                created += 1
+        db.flush()
+    return created
+
+
+def check_idle_occupied(db: Session, *, now: Optional[datetime] = None, minutes: int = 30) -> int:
+    """桩显示占用但无进行中订单，且上一单结束已久：提醒场站核实挪车或枪归位。"""
+    now = now or utcnow()
+    created = 0
+    with _tx(db):
+        for row in dao.list_occupied_without_order(db, now - timedelta(minutes=minutes)):
+            account_id, _ = dao.on_call_accounts(db, row["station_id"], now)
+            if dao.notify(
+                db,
+                account_id=account_id,
+                notification_type="occupied_too_long",
+                business_key=f"occupy:{row['pile_id']}:{now.strftime('%Y-%m-%d')}",
+                title="桩被占用但无进行中订单",
+                content=(
+                    f"桩 #{row['pile_id']} 显示占用，上一单已结束超过 {minutes} 分钟，"
+                    "请核实是否车主未挪车或枪未归位"
+                ),
+                target_path="/maintenance/alerts",
+            ):
+                created += 1
+        db.flush()
+    return created
+
+
+TASKS["temperature"] = check_temperature_warning
+TASKS["metering"] = check_metering_anomaly
+TASKS["occupied"] = check_idle_occupied

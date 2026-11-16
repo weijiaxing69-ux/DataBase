@@ -822,3 +822,64 @@ def station_performance(db: Session, account_id: Optional[int], limit: int = 20)
         {"aid": account_id, "lim": limit},
     ).mappings().all()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# 高温预警、计量异常、充满占位
+# ---------------------------------------------------------------------------
+def list_high_temperature_piles(db: Session, since, threshold: float, samples: int):
+    """最近若干条采样温度都超过阈值（连续高温，尚未报故障码）。"""
+    rows = db.execute(
+        text(
+            """select pile_id, min(module_temperature_c) as min_temp, count(*) as n
+                 from (
+                   select pile_id, module_temperature_c,
+                          row_number() over (partition by pile_id order by sampled_at desc) as rn
+                     from device_reading
+                    where sampled_at >= :since
+                 ) t
+                where rn <= :samples
+                group by pile_id
+               having count(*) = :samples and min(module_temperature_c) > :threshold"""
+        ),
+        {"since": since, "samples": samples, "threshold": threshold},
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def list_metering_anomalies(db: Session, since, amps: float):
+    """没有进行中订单，但采样仍有输出电流：继电器粘连或计量漂移。"""
+    rows = db.execute(
+        text(
+            """select r.pile_id, max(r.output_current_a) as max_amps
+                 from device_reading r
+                where r.sampled_at >= :since and r.output_current_a > :amps
+                  and not exists (
+                        select 1 from charging_order o
+                          join charging_gun g on g.gun_id = o.gun_id
+                         where g.pile_id = r.pile_id and o.status = 'charging')
+                group by r.pile_id"""
+        ),
+        {"since": since, "amps": amps},
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def list_occupied_without_order(db: Session, before):
+    """桩显示占用，但没有进行中订单，且上一单结束已超过指定时间。"""
+    rows = db.execute(
+        text(
+            """select p.pile_id, p.station_id, max(o.finished_at) as last_finished
+                 from charging_pile p
+                 join charging_gun g on g.pile_id = p.pile_id
+                 left join charging_order o on o.gun_id = g.gun_id
+                where p.status = 'occupied'
+                  and not exists (select 1 from charging_order o2
+                                   join charging_gun g2 on g2.gun_id = o2.gun_id
+                                  where g2.pile_id = p.pile_id and o2.status = 'charging')
+                group by p.pile_id, p.station_id
+               having max(o.finished_at) is not null and max(o.finished_at) <= :before"""
+        ),
+        {"before": before},
+    ).mappings().all()
+    return [dict(r) for r in rows]

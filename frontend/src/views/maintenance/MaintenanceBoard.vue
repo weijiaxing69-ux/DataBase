@@ -182,7 +182,9 @@ async function triggerTask(name) {
   try {
     const result = await runTask(name)
     const label = { offline: '离线扫描', overdue: '超时升级', recovery: '恢复推进',
-                    charging: '充电中断', safety: '安全停机', recurring: '复发升级' }[name] || name
+                    charging: '充电中断', safety: '安全停机', recurring: '复发升级',
+                    inspection: '巡检到期', temperature: '高温预警',
+                    metering: '计量异常', occupied: '位占用检查' }[name] || name
     showToast(`${label}完成，影响 ${result.affected} 条`)
     await load()
   } catch (e) {
@@ -221,6 +223,9 @@ onUnmounted(() => {
           <option value="charging">充电中断</option>
           <option value="safety">安全停机派单</option>
           <option value="recurring">复发故障升级</option>
+          <option value="temperature">高温预警</option>
+          <option value="metering">计量异常</option>
+          <option value="occupied">充满占位</option>
         </select>
         <button class="mt-ghost" :disabled="busy" @click="triggerTask(taskName)">
           <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M3 8h10M9 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>

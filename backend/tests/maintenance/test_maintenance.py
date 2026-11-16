@@ -994,3 +994,89 @@ def test_performance_stats_shape(db):
     assert first.avg_accept_seconds is None or first.avg_accept_seconds >= 0
     assert stats.stations, "应有场站统计"
     assert stats.stations[0].alerts >= 0
+
+
+# ---------------------------------------------------------------------------
+# 28. 高温预警：连续三条采样超过阈值
+# ---------------------------------------------------------------------------
+def test_temperature_warning_creates_alert(db):
+    pile_id = 14
+    db.execute(text("delete from device_alert where alert_code = 'TEMP01' and pile_id = :p"), {"p": pile_id})
+    db.commit()
+    now = ms_now()
+    try:
+        for offset in (60, 120, 180):
+            db.execute(text(
+                """insert into device_reading
+                   (pile_id, sampled_at, output_voltage_v, output_current_a, power_kw,
+                    module_temperature_c, offline_seconds, fault_code)
+                   values (:p, :t, 400, 20, 8, 71, 0, 'NONE')"""
+            ), {"p": pile_id, "t": now - timedelta(seconds=offset)})
+        db.commit()
+
+        assert service.check_temperature_warning(db, now=now) >= 1
+        assert db.execute(text(
+            "select severity from device_alert where alert_code = 'TEMP01' and pile_id = :p"
+        ), {"p": pile_id}).scalar_one() == "high"
+        assert service.check_temperature_warning(db, now=now) == 0
+    finally:
+        _cleanup_alert_chain(db, [r[0] for r in db.execute(text(
+            "select alert_id from device_alert where alert_code = 'TEMP01' and pile_id = :p"), {"p": pile_id})])
+        db.execute(text("delete from device_reading where pile_id = :p and sampled_at >= :t"),
+                   {"p": pile_id, "t": now - timedelta(minutes=10)})
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 29. 计量异常：无订单仍有输出电流
+# ---------------------------------------------------------------------------
+def test_metering_anomaly_detected(db):
+    pile_id = 13
+    db.execute(text("delete from device_alert where alert_code = 'MET01' and pile_id = :p"), {"p": pile_id})
+    db.commit()
+    now = ms_now()
+    try:
+        db.execute(text(
+            """insert into device_reading
+               (pile_id, sampled_at, output_voltage_v, output_current_a, power_kw,
+                module_temperature_c, offline_seconds, fault_code)
+               values (:p, :t, 380, 6.5, 2.5, 40, 0, 'NONE')"""
+        ), {"p": pile_id, "t": now - timedelta(seconds=30)})
+        db.commit()
+
+        assert service.check_metering_anomaly(db, now=now) >= 1
+        assert db.execute(text(
+            "select severity, status from device_alert where alert_code = 'MET01' and pile_id = :p"
+        ), {"p": pile_id}).one()[0] == "critical"
+        assert service.check_metering_anomaly(db, now=now) == 0
+    finally:
+        _cleanup_alert_chain(db, [r[0] for r in db.execute(text(
+            "select alert_id from device_alert where alert_code = 'MET01' and pile_id = :p"), {"p": pile_id})])
+        db.execute(text("delete from device_reading where pile_id = :p and sampled_at >= :t"),
+                   {"p": pile_id, "t": now - timedelta(minutes=10)})
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 30. 充满占位：桩占用但无订单，提醒场站核实
+# ---------------------------------------------------------------------------
+def test_occupied_without_order_notifies(db):
+    pile_id = 11
+    now = utcnow()
+    db.execute(text("delete from notification where notification_type = 'occupied_too_long'"))
+    original = db.execute(text("select status from charging_pile where pile_id = :p"),
+                          {"p": pile_id}).scalar_one()
+    db.execute(text("update charging_pile set status = 'occupied' where pile_id = :p"), {"p": pile_id})
+    db.commit()
+    try:
+        assert service.check_idle_occupied(db, now=now, minutes=30) >= 1
+        assert db.execute(text(
+            "select count(*) from notification where notification_type = 'occupied_too_long'"
+        )).scalar_one() >= 1
+        # 同一天同一桩只提醒一次
+        assert service.check_idle_occupied(db, now=now, minutes=30) == 0
+    finally:
+        db.execute(text("delete from notification where notification_type = 'occupied_too_long'"))
+        db.execute(text("update charging_pile set status = :s where pile_id = :p"),
+                   {"s": original, "p": pile_id})
+        db.commit()

@@ -30,6 +30,7 @@ mysql -u root -h 127.0.0.1 charging_platform_test < 05_seed_scenarios.sql
 | `17_security_hardening.sql` | 补齐 6 个 maintenance 权限码并授权；采样表加 (pile_id, sampled_at) 唯一键 |
 | `18_charging_anomaly_rule.sql` | 充电中断识别规则（CHG01，high，30 分钟响应） |
 | `19_part_stock_movement.sql` | 备件出入库流水表 + 历史领用补录 |
+| `20_temperature_metering_rules.sql` | 高温预警 TEMP01、计量异常 MET01 规则 |
 
 ## 现场问题识别（后台任务）
 
@@ -39,6 +40,9 @@ mysql -u root -h 127.0.0.1 charging_platform_test < 05_seed_scenarios.sql
 | `auto_dispatch_safety_alerts` | 严重级告警自动停机并派单 |
 | `escalate_recurring_faults` | 同桩同码 30 天内 ≥3 次，升级在办工单 |
 | `check_inspection_due` | 活跃桩超 30 天未巡检，给场站发待办（按月去重） |
+| `check_temperature_warning` | 连续 3 条采样 > 65℃，在报故障码前预警 |
+| `check_metering_anomaly` | 无进行中订单仍有输出电流，继电器粘连/计量漂移 |
+| `check_idle_occupied` | 桩占用但无订单，提醒场站核实挪车或枪归位 |
 
 调度器每分钟调用；也可通过 `POST /api/v1/maintenance/tasks/{name}/run` 手动触发（仅管理员）。
 

@@ -361,12 +361,12 @@ def stats_performance(db: Database, actor: CurrentActor):
 @router.post(
     "/tasks/{name}/run",
     summary="手动触发一次后台任务",
-    description="offline 心跳超时置离线；overdue 超时未接单升级；recovery 推进告警恢复；charging 识别充电中断；safety 严重告警自动停机派单；recurring 复发故障升级。",
+    description="offline 心跳超时置离线；overdue 超时未接单升级；recovery 推进告警恢复；charging 充电中断；safety 严重告警停机派单；recurring 复发故障升级；inspection 巡检到期；temperature 高温预警；metering 计量异常；occupied 充满占位。",
 )
 def run_task(
     db: Database,
     actor: CurrentActor,
-    name: Annotated[str, Path(pattern="^(offline|overdue|recovery|charging|safety|recurring|inspection)$")],
+    name: Annotated[str, Path(pattern="^(offline|overdue|recovery|charging|safety|recurring|inspection|temperature|metering|occupied)$")],
 ):
     return service.run_task(db, actor=actor, name=name)
 
