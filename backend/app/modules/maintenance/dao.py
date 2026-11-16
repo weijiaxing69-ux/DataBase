@@ -35,6 +35,28 @@ SCOPE_WORK_ORDER = text(
 )
 
 
+SCOPE_FAULT_REPORT = text(
+    """exists (
+         select 1 from charging_gun g
+           join charging_pile p on p.pile_id = g.pile_id
+           join station st on st.station_id = p.station_id
+          where g.gun_id = fault_report.gun_id
+            and (st.station_id in (select station_id from sys_account_station where account_id = :aid)
+                 or st.operator_id in (select operator_id from sys_account_operator where account_id = :aid))
+       )"""
+)
+
+SCOPE_INSPECTION = text(
+    """exists (
+         select 1 from charging_pile p
+           join station st on st.station_id = p.station_id
+          where p.pile_id = inspection_record.pile_id
+            and (st.station_id in (select station_id from sys_account_station where account_id = :aid)
+                 or st.operator_id in (select operator_id from sys_account_operator where account_id = :aid))
+       )"""
+)
+
+
 def _page(db: Session, stmt, page: int, page_size: int):
     total = db.execute(select(func.count()).select_from(stmt.subquery())).scalar_one()
     rows = db.execute(stmt.limit(page_size).offset((page - 1) * page_size)).scalars().all()
@@ -320,8 +342,10 @@ def get_fault_report(db: Session, report_id: int):
     ).scalar_one_or_none()
 
 
-def list_fault_reports(db: Session, q: s.FaultReportQuery):
+def list_fault_reports(db: Session, q: s.FaultReportQuery, *, account_id: Optional[int] = None):
     stmt = select(m.FaultReport).order_by(m.FaultReport.created_at.desc())
+    if account_id is not None:
+        stmt = stmt.where(SCOPE_FAULT_REPORT.bindparams(aid=account_id))
     if q.status:
         stmt = stmt.where(m.FaultReport.status == q.status)
     if q.gun_id:
@@ -348,8 +372,10 @@ def get_inspection(db: Session, inspection_id: int):
     ).scalar_one_or_none()
 
 
-def list_inspections(db: Session, q: s.InspectionQuery):
+def list_inspections(db: Session, q: s.InspectionQuery, *, account_id: Optional[int] = None):
     stmt = select(m.InspectionRecord).order_by(m.InspectionRecord.inspected_at.desc())
+    if account_id is not None:
+        stmt = stmt.where(SCOPE_INSPECTION.bindparams(aid=account_id))
     if q.pile_id:
         stmt = stmt.where(m.InspectionRecord.pile_id == q.pile_id)
     if q.result:

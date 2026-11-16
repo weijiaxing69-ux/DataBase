@@ -239,6 +239,7 @@ class HeartbeatAck(StrictModel):
 
 
 class ReadingAck(StrictModel):
-    sample_id: int
+    sample_id: int = 0
     accepted: bool = True
     alert_generated: bool = False
+    duplicate: bool = False

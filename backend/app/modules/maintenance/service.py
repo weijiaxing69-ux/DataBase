@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core import security
@@ -23,6 +24,7 @@ from app.core.errors import BusinessError
 from app.modules.maintenance import dao
 from app.modules.maintenance import models as m
 from app.modules.maintenance import schemas as s
+from app.modules.maintenance.device import DeviceActor
 from app.shared.contracts import Actor, PageResult
 
 # 事件类型 -> (允许的当前状态, 迁移后的状态)
@@ -44,6 +46,12 @@ PERM_ALERT_READ = "maintenance.alert.read"
 PERM_READING = "maintenance.device_reading.read"
 PERM_ASSIGN = "maintenance.work_order.assign"
 PERM_HANDLE = "maintenance.work_order.handle"
+# 17_security_hardening.sql 补齐的细粒度码；未执行时用上面的旧码兜底
+PERM_RULE_MANAGE = "maintenance.rule.manage"
+PERM_INSPECT_READ = "maintenance.inspection.read"
+PERM_INSPECT_WRITE = "maintenance.inspection.create"
+PERM_REPORT_READ = "maintenance.fault_report.read"
+PERM_REPORT_HANDLE = "maintenance.fault_report.handle"
 
 
 def utcnow() -> datetime:
@@ -53,16 +61,30 @@ def utcnow() -> datetime:
 
 @contextmanager
 def _tx(db: Session):
-    """最外层开启事务并提交；嵌套调用复用当前事务。"""
-    if db.in_transaction():
-        yield db
+    """事务边界：最外层提交，嵌套调用只参与不提交。
+
+    注意：SQLAlchemy 的 autobegin 会在任何 SELECT 之后把会话标记为「已在事务中」，
+    因此不能用 `db.in_transaction()` 判断是否该提交——那样只要函数开头查过一次，
+    写入就永远不会提交。这里用显式的嵌套计数判断。
+    """
+    depth = getattr(db, "_mt_tx_depth", 0)
+    if depth:
+        db._mt_tx_depth = depth + 1
+        try:
+            yield db
+        finally:
+            db._mt_tx_depth = depth - 1
         return
+
+    db._mt_tx_depth = 1
     try:
         yield db
         db.commit()
     except Exception:
         db.rollback()
         raise
+    finally:
+        db._mt_tx_depth = 0
 
 
 def _require(actor: Actor, *permissions: str) -> None:
@@ -155,13 +177,13 @@ def _maybe_recover_alert(db: Session, alert: m.DeviceAlert, now: datetime) -> No
 # 告警规则
 # ---------------------------------------------------------------------------
 def list_alarm_rules(db: Session, *, actor: Actor, query: s.AlarmRuleQuery) -> PageResult[s.AlarmRuleDetail]:
-    _require(actor, PERM_ALERT_READ, PERM_ASSIGN)
+    _require(actor, PERM_RULE_MANAGE, PERM_ALERT_READ, PERM_ASSIGN)
     rows, total = dao.list_alarm_rules(db, query)
     return _list_page([s.AlarmRuleDetail.model_validate(r) for r in rows], total, query)
 
 
 def get_alarm_rule(db: Session, *, actor: Actor, alarm_rule_id: int) -> s.AlarmRuleDetail:
-    _require(actor, PERM_ALERT_READ, PERM_ASSIGN)
+    _require(actor, PERM_RULE_MANAGE, PERM_ALERT_READ, PERM_ASSIGN)
     row = dao.get_alarm_rule(db, alarm_rule_id)
     if row is None:
         raise BusinessError("告警规则不存在", status_code=404)
@@ -169,7 +191,7 @@ def get_alarm_rule(db: Session, *, actor: Actor, alarm_rule_id: int) -> s.AlarmR
 
 
 def create_alarm_rule(db: Session, *, actor: Actor, request: s.CreateAlarmRuleRequest) -> s.AlarmRuleDetail:
-    _require(actor, PERM_ASSIGN)
+    _require(actor, PERM_RULE_MANAGE, PERM_ASSIGN)
     with _tx(db):
         row = dao.create_alarm_rule(db, request)
         return s.AlarmRuleDetail.model_validate(row)
@@ -178,7 +200,7 @@ def create_alarm_rule(db: Session, *, actor: Actor, request: s.CreateAlarmRuleRe
 def update_alarm_rule(
     db: Session, *, actor: Actor, alarm_rule_id: int, request: s.UpdateAlarmRuleRequest
 ) -> s.AlarmRuleDetail:
-    _require(actor, PERM_ASSIGN)
+    _require(actor, PERM_RULE_MANAGE, PERM_ASSIGN)
     with _tx(db):
         row = dao.get_alarm_rule(db, alarm_rule_id, for_update=True)
         if row is None:
@@ -320,10 +342,10 @@ def append_work_order_event(
 # ---------------------------------------------------------------------------
 # 设备上报
 # ---------------------------------------------------------------------------
-def receive_heartbeat(db: Session, *, actor: Actor, request: s.HeartbeatRequest) -> s.HeartbeatAck:
-    # TODO 设备身份：待成员1 提供「凭据换身份」的依赖后替换为设备鉴权。
-    # 当前按持有设备上报权限的账号放行，仅用于联调。
-    _require(actor, PERM_READING, PERM_HANDLE)
+def receive_heartbeat(db: Session, *, device: DeviceActor, request: s.HeartbeatRequest) -> s.HeartbeatAck:
+    """设备心跳。身份来自设备凭据，且只能给自己绑定的桩上报。"""
+    if request.pile_id != device.pile_id:
+        raise PermissionError("设备凭据与上报的桩不一致")
     with _tx(db):
         pile = dao.get_pile(db, request.pile_id, for_update=True)
         if pile is None:
@@ -349,13 +371,20 @@ def receive_heartbeat(db: Session, *, actor: Actor, request: s.HeartbeatRequest)
         return s.HeartbeatAck(pile_id=pile.pile_id, is_online=1, server_time=utcnow())
 
 
-def ingest_device_reading(db: Session, *, actor: Actor, request: s.DeviceReadingRequest) -> s.ReadingAck:
-    _require(actor, PERM_READING, PERM_HANDLE)
+def ingest_device_reading(db: Session, *, device: DeviceActor, request: s.DeviceReadingRequest) -> s.ReadingAck:
+    """上报采样。同一桩同一采样时刻只保留一条，重复上报返回 duplicate=true。"""
+    if request.pile_id != device.pile_id:
+        raise PermissionError("设备凭据与上报的桩不一致")
     with _tx(db):
         pile = dao.get_pile(db, request.pile_id)
         if pile is None:
             raise BusinessError("充电桩不存在", status_code=404)
-        row = dao.insert_reading(db, request)
+        try:
+            row = dao.insert_reading(db, request)
+        except IntegrityError:
+            # 唯一键 (pile_id, sampled_at) 兜住并发重复上报
+            db.rollback()
+            return s.ReadingAck(sample_id=0, accepted=False, duplicate=True)
         generated = dao.count_alerts_since(
             db, request.pile_id, request.sampled_at - timedelta(seconds=1)
         ) > 0
@@ -366,16 +395,17 @@ def ingest_device_reading(db: Session, *, actor: Actor, request: s.DeviceReading
 # 报障 / 巡检
 # ---------------------------------------------------------------------------
 def list_fault_reports(db: Session, *, actor: Actor, query: s.FaultReportQuery) -> PageResult[s.FaultReportDetail]:
-    _require(actor, PERM_HANDLE, PERM_ALERT_READ)
-    rows, total = dao.list_fault_reports(db, query)
+    _require(actor, PERM_REPORT_READ, PERM_HANDLE, PERM_ALERT_READ)
+    rows, total = dao.list_fault_reports(db, query, account_id=_scope_account(actor))
     return _list_page([s.FaultReportDetail.model_validate(r) for r in rows], total, query)
 
 
 def get_fault_report(db: Session, *, actor: Actor, report_id: int) -> s.FaultReportDetail:
-    _require(actor, PERM_HANDLE, PERM_ALERT_READ)
+    _require(actor, PERM_REPORT_READ, PERM_HANDLE, PERM_ALERT_READ)
     row = dao.get_fault_report(db, report_id)
     if row is None:
         raise BusinessError("报障记录不存在", status_code=404)
+    security.assert_resource_scope(db, actor, resource_type="gun", resource_id=row.gun_id)
     return s.FaultReportDetail.model_validate(row)
 
 
@@ -391,7 +421,7 @@ def create_fault_report(db: Session, *, actor: Actor, request: s.CreateFaultRepo
 def handle_fault_report(
     db: Session, *, actor: Actor, report_id: int, request: s.HandleFaultReportRequest
 ) -> s.FaultReportDetail:
-    _require(actor, PERM_HANDLE)
+    _require(actor, PERM_REPORT_HANDLE, PERM_HANDLE)
     with _tx(db):
         row = dao.get_fault_report(db, report_id)
         if row is None:
@@ -408,21 +438,22 @@ def handle_fault_report(
 
 
 def list_inspections(db: Session, *, actor: Actor, query: s.InspectionQuery) -> PageResult[s.InspectionDetail]:
-    _require(actor, PERM_HANDLE, PERM_ALERT_READ)
-    rows, total = dao.list_inspections(db, query)
+    _require(actor, PERM_INSPECT_READ, PERM_HANDLE, PERM_ALERT_READ)
+    rows, total = dao.list_inspections(db, query, account_id=_scope_account(actor))
     return _list_page([s.InspectionDetail.model_validate(r) for r in rows], total, query)
 
 
 def get_inspection(db: Session, *, actor: Actor, inspection_id: int) -> s.InspectionDetail:
-    _require(actor, PERM_HANDLE, PERM_ALERT_READ)
+    _require(actor, PERM_INSPECT_READ, PERM_HANDLE, PERM_ALERT_READ)
     row = dao.get_inspection(db, inspection_id)
     if row is None:
         raise BusinessError("巡检记录不存在", status_code=404)
+    _scope_pile(db, actor, row.pile_id)
     return s.InspectionDetail.model_validate(row)
 
 
 def create_inspection(db: Session, *, actor: Actor, request: s.CreateInspectionRequest) -> s.InspectionDetail:
-    _require(actor, PERM_HANDLE)
+    _require(actor, PERM_INSPECT_WRITE, PERM_HANDLE)
     with _tx(db):
         pile = dao.get_pile(db, request.pile_id)
         if pile is None:
@@ -537,7 +568,8 @@ TASKS = {"offline": check_offline_devices, "overdue": check_overdue_work_orders}
 
 def run_task(db: Session, *, actor: Actor, name: str) -> dict:
     """手动触发一次后台任务，用于演示与排查；生产由调度器调用。"""
-    _require(actor, PERM_ASSIGN)
+    if "platform_admin" not in actor.roles:
+        raise PermissionError("只有平台管理员可以手动触发后台任务")
     fn = TASKS.get(name)
     if fn is None:
         raise ValueError(f"未知任务：{name}，可选 offline / overdue")

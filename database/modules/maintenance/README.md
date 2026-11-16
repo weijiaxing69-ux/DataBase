@@ -21,6 +21,14 @@ mysql -u root -h 127.0.0.1 charging_platform_test < 04_triggers.sql
 mysql -u root -h 127.0.0.1 charging_platform_test < 05_seed_scenarios.sql
 ```
 
+## 迁移脚本（database/migrations）
+
+| 文件 | 内容 |
+|---|---|
+| `10~15` | V1.5 应急增强：11 张增量表、视图、过程、触发器、场景数据 |
+| `16_indexes.sql` | 列表排序索引（告警时间、工单派单时间、巡检时间） |
+| `17_security_hardening.sql` | 补齐 6 个 maintenance 权限码并授权；采样表加 (pile_id, sampled_at) 唯一键 |
+
 ## V1.5 应急增强（增量）
 
 放在 `database/migrations/`，按 10 → 15 顺序执行；**不动 bootstrap 的 65 张表**，

@@ -6,15 +6,16 @@ main.py 注册时统一加前缀 `/api/v1/maintenance` 与标签「设备运维�
 
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
 from app.core import security
-from app.core.database import get_db
+from app.core.database import SessionLocal, get_db
 from app.shared.contracts import Actor, PageResult
 
 from . import emergency, schemas as s, service
+from .device import DeviceActor, authenticate_device
 
 router = APIRouter()
 _bearer = HTTPBearer(auto_error=False)
@@ -34,6 +35,21 @@ def _get_request_actor(
 
 Database = Annotated[Session, Depends(get_db)]
 CurrentActor = Annotated[Actor, Depends(_get_request_actor)]
+
+
+def _device_token(x_device_token: Annotated[str | None, Header()] = None) -> str:
+    if not x_device_token:
+        raise HTTPException(401, "缺少设备凭据：X-Device-Token", headers={"WWW-Authenticate": "Device"})
+    return x_device_token
+
+
+def _device_actor(token: Annotated[str, Depends(_device_token)]) -> DeviceActor:
+    # 用独立会话校验凭据，避免给业务会话留下未结束的事务
+    with SessionLocal() as db:
+        return authenticate_device(db, token)
+
+
+Device = Annotated[DeviceActor, Depends(_device_actor)]
 
 
 # ---------------------------------------------------------------- 告警规则
@@ -182,22 +198,22 @@ def append_work_order_event(
 # ---------------------------------------------------------------- 设备上报
 @router.post(
     "/heartbeats",
-    summary="设备心跳上报",
-    description="只判断通信在线，不判断枪是否占用。采样时间不晚于已记录心跳时视为重复上报，返回 duplicate=true。",
+    summary="设备心跳上报（设备凭据）",
+    description="需在请求头 X-Device-Token 携带设备凭据；只判断通信在线，不判断枪是否占用。重复上报返回 duplicate=true。",
     response_model=s.HeartbeatAck,
 )
-def heartbeat(db: Database, actor: CurrentActor, request: s.HeartbeatRequest):
-    return service.receive_heartbeat(db, actor=actor, request=request)
+def heartbeat(db: Database, device: Device, request: s.HeartbeatRequest):
+    return service.receive_heartbeat(db, device=device, request=request)
 
 
 @router.post(
     "/readings",
-    summary="上报运行采样",
-    description="入库后由触发器按故障码与温度阈值自动生成告警；重复上报同一未恢复告警会被唯一键静默去重。",
+    summary="上报运行采样（设备凭据）",
+    description="需在请求头 X-Device-Token 携带设备凭据；入库后由触发器自动生成告警，同一桩同一采样时刻重复上报返回 duplicate=true。",
     response_model=s.ReadingAck,
 )
-def upload_reading(db: Database, actor: CurrentActor, request: s.DeviceReadingRequest):
-    return service.ingest_device_reading(db, actor=actor, request=request)
+def upload_reading(db: Database, device: Device, request: s.DeviceReadingRequest):
+    return service.ingest_device_reading(db, device=device, request=request)
 
 
 # ---------------------------------------------------------------- 报障 / 巡检
