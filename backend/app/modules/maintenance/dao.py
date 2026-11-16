@@ -410,69 +410,176 @@ def list_events(db: Session, work_order_id: int):
     )
 
 
-def kpi_counts(db: Session) -> dict:
-    from sqlalchemy import text
+def _scope(pile_expr: str, account_id: Optional[int]) -> str:
+    """按账号授权场站拼 SQL 条件；account_id 为空表示不限。"""
+    if account_id is None:
+        return "1=1"
+    return (
+        "exists (select 1 from charging_pile p join station st on st.station_id = p.station_id "
+        f"where p.pile_id = {pile_expr} and ("
+        "st.station_id in (select station_id from sys_account_station where account_id = :aid) "
+        "or st.operator_id in (select operator_id from sys_account_operator where account_id = :aid)))"
+    )
 
+
+def kpi_counts(db: Session, account_id: Optional[int] = None) -> dict:
+    alert_scope = _scope("a.pile_id", account_id)
+    order_scope = _scope("(select da.pile_id from device_alert da where da.alert_id = w.alert_id)", account_id)
+    incident_scope = "1=1" if account_id is None else (
+        "exists (select 1 from station st where st.station_id = i.station_id and ("
+        "st.station_id in (select station_id from sys_account_station where account_id = :aid) "
+        "or st.operator_id in (select operator_id from sys_account_operator where account_id = :aid)))"
+    )
     row = db.execute(
         text(
-            """select
-                 (select count(*) from device_alert where status <> 'recovered')            as open_alerts,
-                 (select count(*) from work_order
-                   where status = 'assigned' and response_due_at < utc_timestamp())         as overdue_orders,
-                 (select count(*) from work_order where status <> 'closed')                 as open_orders,
-                 (select count(*) from incident
-                   where status in ('detected','declared','contained'))                     as active_incidents,
-                 (select count(*) from work_order_event
-                   where event_type = 'closed' and event_at >= utc_timestamp() - interval 1 day) as closed_today
+            f"""select
+                 (select count(*) from device_alert a
+                   where a.status <> 'recovered' and {alert_scope})                        as open_alerts,
+                 (select count(*) from work_order w
+                   where w.status = 'assigned' and w.response_due_at < utc_timestamp()
+                     and {order_scope})                                                    as overdue_orders,
+                 (select count(*) from work_order w
+                   where w.status <> 'closed' and {order_scope})                           as open_orders,
+                 (select count(*) from incident i
+                   where i.status in ('detected','declared','contained') and {incident_scope}) as active_incidents,
+                 (select count(*) from work_order_event e
+                   join work_order w2 on w2.work_order_id = e.work_order_id
+                   where e.event_type = 'closed'
+                     and e.event_at >= utc_timestamp() - interval 1 day
+                     and {_scope('(select da.pile_id from device_alert da where da.alert_id = w2.alert_id)', account_id)}) as closed_today
             """
-        )
+        ),
+        {"aid": account_id},
     ).mappings().one()
     return dict(row)
 
 
-def alert_trend(db: Session, days: int = 30) -> list[dict]:
-    from sqlalchemy import text
-
+def alert_trend(db: Session, days: int = 30, account_id: Optional[int] = None) -> list[dict]:
     rows = db.execute(
         text(
-            f"""select date(occurred_at) as d, count(*) as c
-                  from device_alert
-                 where occurred_at >= utc_timestamp() - interval {int(days)} day
-                 group by date(occurred_at)
+            f"""select date(a.occurred_at) as d, count(*) as c
+                  from device_alert a
+                 where a.occurred_at >= utc_timestamp() - interval {int(days)} day
+                   and {_scope('a.pile_id', account_id)}
+                 group by date(a.occurred_at)
                  order by d"""
-        )
+        ),
+        {"aid": account_id},
     ).mappings().all()
     return [{"date": str(r["d"]), "count": int(r["c"])} for r in rows]
 
 
-def severity_distribution(db: Session) -> list[dict]:
-    from sqlalchemy import text
-
+def severity_distribution(db: Session, account_id: Optional[int] = None) -> list[dict]:
     rows = db.execute(
         text(
-            """select severity, count(*) as c
-                 from device_alert
-                where status <> 'recovered'
-                group by severity"""
-        )
+            f"""select a.severity, count(*) as c
+                  from device_alert a
+                 where a.status <> 'recovered' and {_scope('a.pile_id', account_id)}
+                 group by a.severity"""
+        ),
+        {"aid": account_id},
     ).mappings().all()
     return [{"severity": r["severity"], "count": int(r["c"])} for r in rows]
 
 
-def station_ranking(db: Session, limit: int = 5) -> list[dict]:
-    from sqlalchemy import text
-
+def station_ranking(db: Session, limit: int = 5, account_id: Optional[int] = None) -> list[dict]:
     rows = db.execute(
         text(
-            """select s.station_id, s.station_name, count(*) as open_alerts
-                 from device_alert a
-                 join charging_pile p on p.pile_id = a.pile_id
-                 join station s on s.station_id = p.station_id
-                where a.status <> 'recovered'
-                group by s.station_id, s.station_name
-                order by open_alerts desc, s.station_id
-                limit :lim"""
+            f"""select s.station_id, s.station_name, count(*) as open_alerts
+                  from device_alert a
+                  join charging_pile p on p.pile_id = a.pile_id
+                  join station s on s.station_id = p.station_id
+                 where a.status <> 'recovered' and {_scope('a.pile_id', account_id)}
+                 group by s.station_id, s.station_name
+                 order by open_alerts desc, s.station_id
+                 limit :lim"""
         ),
-        {"lim": limit},
+        {"lim": limit, "aid": account_id},
     ).mappings().all()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# 备件与校验辅助
+# ---------------------------------------------------------------------------
+def list_spare_parts(db: Session, q: s.PartQuery, *, account_id: Optional[int] = None):
+    stmt = select(m.SparePart).where(m.SparePart.status == "active")
+    if q.station_id is not None:
+        stmt = stmt.where(m.SparePart.station_id == q.station_id)
+    if q.only_low:
+        stmt = stmt.where(m.SparePart.stock_qty <= m.SparePart.safety_stock)
+    if account_id is not None:
+        # 中心库（station_id 为空）对所有账号可见，场站库按授权过滤
+        stmt = stmt.where(
+            m.SparePart.station_id.is_(None)
+            | m.SparePart.station_id.in_(
+                text("select station_id from sys_account_station where account_id = :aid").bindparams(
+                    aid=account_id
+                )
+            )
+        )
+    stmt = stmt.order_by(m.SparePart.part_id)
+    return _page(db, stmt, q.page, q.page_size)
+
+
+def get_spare_part(db: Session, part_id: int, *, for_update: bool = False):
+    stmt = select(m.SparePart).where(m.SparePart.part_id == part_id)
+    if for_update:
+        stmt = stmt.with_for_update()
+    return db.execute(stmt).scalar_one_or_none()
+
+
+def create_part_usage(
+    db: Session, *, work_order_id: int, part_id: int, qty: int,
+    used_at, used_by: int, note: Optional[str],
+) -> m.PartUsage:
+    row = m.PartUsage(
+        work_order_id=work_order_id, part_id=part_id, qty=qty,
+        used_at=used_at, used_by=used_by, note=note,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def list_part_usages(db: Session, work_order_id: int):
+    return list(
+        db.execute(
+            select(m.PartUsage).where(m.PartUsage.work_order_id == work_order_id)
+            .order_by(m.PartUsage.used_at)
+        ).scalars()
+    )
+
+
+def has_event(db: Session, work_order_id: int, event_type: str) -> bool:
+    return db.execute(
+        select(func.count()).select_from(m.WorkOrderEvent).where(
+            m.WorkOrderEvent.work_order_id == work_order_id,
+            m.WorkOrderEvent.event_type == event_type,
+        )
+    ).scalar_one() > 0
+
+
+def account_roles(db: Session, account_id: int) -> set[str]:
+    return set(
+        db.execute(
+            text(
+                """select r.role_code from sys_account_role ar
+                     join sys_role r on r.role_id = ar.role_id
+                    where ar.account_id = :aid"""
+            ),
+            {"aid": account_id},
+        ).scalars().all()
+    )
+
+
+def list_recovering_alerts(db: Session, limit: int):
+    return list(
+        db.execute(
+            select(m.DeviceAlert)
+            .where(m.DeviceAlert.status == "recovering", m.DeviceAlert.normal_since_at.is_not(None))
+            .order_by(m.DeviceAlert.normal_since_at)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        ).scalars()
+    )

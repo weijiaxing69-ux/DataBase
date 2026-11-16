@@ -1,12 +1,7 @@
-"""maintenance 模块：业务逻辑与事务边界。
+"""maintenance 业务逻辑与事务边界。
 
-与骨架对齐的约定：
-- 权限用 `security.has_permission(actor, "模块.资源.动作")`，范围用 `security.assert_resource_scope`。
-- 业务错误抛 `BusinessError(message, status_code=...)`；权限不足抛 `PermissionError`；
-  参数问题抛 `ValueError`（由 core.errors 统一映射为 400/403/404）。
-- 写入口自己提交事务，失败回滚；被其他模块调用的函数只 flush。
-
-对应 V1.4 契约第 6 章 maintenance 段：19 个入口 + 2 个后台任务。
+权限用 security.has_permission，范围用 assert_resource_scope；
+业务错误抛 BusinessError(status_code=...)，权限不足抛 PermissionError。
 """
 
 from __future__ import annotations
@@ -16,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import select, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core import security
@@ -52,6 +47,7 @@ PERM_INSPECT_READ = "maintenance.inspection.read"
 PERM_INSPECT_WRITE = "maintenance.inspection.create"
 PERM_REPORT_READ = "maintenance.fault_report.read"
 PERM_REPORT_HANDLE = "maintenance.fault_report.handle"
+PERM_INCIDENT = "maintenance.incident.manage"
 
 
 def utcnow() -> datetime:
@@ -61,11 +57,9 @@ def utcnow() -> datetime:
 
 @contextmanager
 def _tx(db: Session):
-    """事务边界：最外层提交，嵌套调用只参与不提交。
+    """事务边界：最外层提交，嵌套只参与。
 
-    注意：SQLAlchemy 的 autobegin 会在任何 SELECT 之后把会话标记为「已在事务中」，
-    因此不能用 `db.in_transaction()` 判断是否该提交——那样只要函数开头查过一次，
-    写入就永远不会提交。这里用显式的嵌套计数判断。
+    不能用 db.in_transaction() 判断——autobegin 会让它恒为真，写入永远不提交。
     """
     depth = getattr(db, "_mt_tx_depth", 0)
     if depth:
@@ -148,7 +142,7 @@ def _list_page(rows, total: int, query) -> PageResult:
 
 
 def _maybe_recover_alert(db: Session, alert: m.DeviceAlert, now: datetime) -> None:
-    """C05：全部工单闭环 + 观察窗内无故障采样 + 满 recovery_seconds 才恢复。"""
+    """C05：工单全闭环、观察窗无故障采样、满 recovery_seconds 才恢复。"""
     if dao.count_open_work_orders(db, alert.alert_id) > 0:
         return
 
@@ -240,7 +234,7 @@ def list_work_orders(db: Session, *, actor: Actor, query: s.WorkOrderQuery) -> P
     if _is_engineer(actor):
         if query.assigned_to not in (None, actor.account_id):
             raise PermissionError("运维只能查询指派给自己的工单")
-        query.assigned_to = actor.account_id
+        query = query.model_copy(update={"assigned_to": actor.account_id})
     rows, total = dao.list_work_orders(db, query, account_id=_scope_account(actor))
     return _list_page(_work_order_details(db, rows), total, query)
 
@@ -269,6 +263,8 @@ def create_work_order(
         _scope_pile(db, actor, alert.pile_id)
         if alert.status == "recovered":
             raise BusinessError("告警已恢复，不能派单", status_code=409)
+        if not dao.account_roles(db, request.assigned_to) & {"maintenance_engineer", "platform_admin"}:
+            raise ValueError("被指派人不是运维人员")
 
         now = utcnow()
         due = now + timedelta(seconds=alert.response_seconds_snapshot)
@@ -281,7 +277,6 @@ def create_work_order(
             response_due_at=due,
         )
         alert.status = "processing"
-        # 契约的事件枚举里没有「派单」事件，派单信息落在 work_order.assigned_at
         db.flush()
         return _work_order_detail(db, wo)
 
@@ -309,6 +304,10 @@ def append_work_order_event(
         event_at = request.event_at or utcnow()
         if event_at < wo.assigned_at:
             raise ValueError("事件时间不能早于派单时间")
+        if event_at > utcnow() + timedelta(minutes=5):
+            raise ValueError("事件时间不能晚于当前时间")
+        if request.event_type == "closed" and not dao.has_event(db, work_order_id, "review_passed"):
+            raise BusinessError("闭环前必须有复核通过记录", status_code=409)
 
         dao.add_event(
             db,
@@ -327,8 +326,7 @@ def append_work_order_event(
         if request.result:
             wo.result = request.result
 
-        # 先落库再判定恢复：Session 关闭了 autoflush，不 flush 会读到旧状态
-        db.flush()
+        db.flush()   # 先落库，否则恢复判定会读到旧状态
 
         if request.event_type == "closed":
             current = dao.get_alert(db, wo.alert_id, for_update=True)
@@ -343,7 +341,7 @@ def append_work_order_event(
 # 设备上报
 # ---------------------------------------------------------------------------
 def receive_heartbeat(db: Session, *, device: DeviceActor, request: s.HeartbeatRequest) -> s.HeartbeatAck:
-    """设备心跳。身份来自设备凭据，且只能给自己绑定的桩上报。"""
+    """心跳：设备身份只能给自己绑定的桩上报。"""
     if request.pile_id != device.pile_id:
         raise PermissionError("设备凭据与上报的桩不一致")
     with _tx(db):
@@ -372,7 +370,7 @@ def receive_heartbeat(db: Session, *, device: DeviceActor, request: s.HeartbeatR
 
 
 def ingest_device_reading(db: Session, *, device: DeviceActor, request: s.DeviceReadingRequest) -> s.ReadingAck:
-    """上报采样。同一桩同一采样时刻只保留一条，重复上报返回 duplicate=true。"""
+    """采样：同桩同时刻只保留一条，重复上报返回 duplicate=true。"""
     if request.pile_id != device.pile_id:
         raise PermissionError("设备凭据与上报的桩不一致")
     with _tx(db):
@@ -428,6 +426,8 @@ def handle_fault_report(
             raise BusinessError("报障记录不存在", status_code=404)
         if row.status == "resolved":
             raise BusinessError("报障已处理完毕", status_code=409)
+        if request.status == "linked" and request.alert_id is None:
+            raise ValueError("关联告警时必须提供 alert_id")
         row.status = request.status
         row.handled_by = actor.account_id
         row.handled_at = utcnow()
@@ -477,7 +477,7 @@ def _offline_threshold(db: Session) -> int:
 
 
 def check_offline_devices(db: Session, *, now: Optional[datetime] = None, batch: int = BATCH_SIZE) -> int:
-    """心跳超阈值置离线并写状态日志。幂等：只处理 is_online=1 的桩。"""
+    """心跳超阈值置离线并写状态日志；只处理 is_online=1 的桩。"""
     now = now or utcnow()
     threshold = _offline_threshold(db)
     count = 0
@@ -509,7 +509,7 @@ def _supervisor_of_station(db: Session, station_id: int, now: datetime):
 
 
 def check_overdue_work_orders(db: Session, *, now: Optional[datetime] = None, batch: int = BATCH_SIZE) -> int:
-    """超时未接单自动升级：级别 +1、写 escalated 事件、通知值班主管。"""
+    """超时未接单：级别 +1、写 escalated 事件、通知值班主管。"""
     now = now or utcnow()
     count = 0
     with _tx(db):
@@ -554,16 +554,35 @@ def list_work_order_events(db: Session, *, actor: Actor, work_order_id: int) -> 
 def overview(db: Session, *, actor: Actor) -> dict:
     """看板聚合：KPI + 近 30 天趋势 + 等级分布 + 场站排行。"""
     _require(actor, PERM_ALERT_READ, PERM_HANDLE)
+    account_id = _scope_account(actor)
     return {
-        "kpi": dao.kpi_counts(db),
-        "trend": dao.alert_trend(db, 30),
-        "severity": dao.severity_distribution(db),
-        "stations": dao.station_ranking(db, 5),
+        "kpi": dao.kpi_counts(db, account_id),
+        "trend": dao.alert_trend(db, 30, account_id),
+        "severity": dao.severity_distribution(db, account_id),
+        "stations": dao.station_ranking(db, 5, account_id),
         "generated_at": utcnow().isoformat(timespec="seconds"),
     }
 
 
-TASKS = {"offline": check_offline_devices, "overdue": check_overdue_work_orders}
+def check_alert_recovery(db: Session, *, now: Optional[datetime] = None, batch: int = 200) -> int:
+    """推进 recovering 告警：观察期满且无采样故障则恢复。"""
+    now = now or utcnow()
+    changed = 0
+    with _tx(db):
+        for alert in dao.list_recovering_alerts(db, batch):
+            before = alert.status
+            _maybe_recover_alert(db, alert, now)
+            if alert.status != before:
+                changed += 1
+        db.flush()
+    return changed
+
+
+TASKS = {
+    "offline": check_offline_devices,
+    "overdue": check_overdue_work_orders,
+    "recovery": check_alert_recovery,
+}
 
 
 def run_task(db: Session, *, actor: Actor, name: str) -> dict:
@@ -576,3 +595,61 @@ def run_task(db: Session, *, actor: Actor, name: str) -> dict:
     now = utcnow()
     affected = fn(db, now=now)
     return {"task": name, "affected": affected, "ran_at": now.isoformat(timespec="seconds")}
+
+
+# ---------------------------------------------------------------------------
+# 备件领用（V1.5）
+# ---------------------------------------------------------------------------
+def list_spare_parts(db: Session, *, actor: Actor, query: s.PartQuery):
+    _require(actor, PERM_HANDLE, PERM_INSPECT_READ, PERM_ASSIGN)
+    rows, total = dao.list_spare_parts(db, query, account_id=_scope_account(actor))
+    items = []
+    for row in rows:
+        detail = s.SparePartDetail.model_validate(row)
+        detail.low_stock = row.stock_qty <= row.safety_stock
+        items.append(detail)
+    return _list_page(items, total, query)
+
+
+def create_part_usage(db: Session, *, actor: Actor, request: s.CreatePartUsageRequest):
+    """领用备件：库存由触发器扣减，不足返回 409。"""
+    _require(actor, PERM_HANDLE)
+    if actor.account_id is None:
+        raise PermissionError("未登录")
+    with _tx(db):
+        wo = dao.get_work_order(db, request.work_order_id, for_update=True)
+        if wo is None:
+            raise BusinessError("工单不存在", status_code=404)
+        alert = dao.get_alert(db, wo.alert_id)
+        if alert is not None:
+            _scope_pile(db, actor, alert.pile_id)
+        part = dao.get_spare_part(db, request.part_id, for_update=True)
+        if part is None:
+            raise BusinessError("备件不存在", status_code=404)
+        if part.station_id is not None:
+            security.assert_resource_scope(db, actor, resource_type="station", resource_id=part.station_id)
+        try:
+            row = dao.create_part_usage(
+                db,
+                work_order_id=request.work_order_id,
+                part_id=request.part_id,
+                qty=request.qty,
+                used_at=utcnow(),
+                used_by=actor.account_id,
+                note=request.note,
+            )
+        except DBAPIError as exc:
+            db.rollback()
+            raise BusinessError("备件库存不足，领用失败", status_code=409) from exc
+        return s.PartUsageDetail.model_validate(row)
+
+
+def list_part_usages(db: Session, *, actor: Actor, work_order_id: int):
+    _require(actor, PERM_HANDLE, PERM_INSPECT_READ)
+    wo = dao.get_work_order(db, work_order_id)
+    if wo is None:
+        raise BusinessError("工单不存在", status_code=404)
+    alert = dao.get_alert(db, wo.alert_id)
+    if alert is not None:
+        _scope_pile(db, actor, alert.pile_id)
+    return [s.PartUsageDetail.model_validate(r) for r in dao.list_part_usages(db, work_order_id)]

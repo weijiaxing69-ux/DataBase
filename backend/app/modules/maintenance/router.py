@@ -353,5 +353,58 @@ def stats_overview(db: Database, actor: CurrentActor):
     summary="手动触发一次后台任务",
     description="name 取 offline（心跳超时置离线）或 overdue（超时未接单升级）。",
 )
-def run_task(db: Database, actor: CurrentActor, name: Annotated[str, Path(pattern="^(offline|overdue)$")]):
+def run_task(
+    db: Database,
+    actor: CurrentActor,
+    name: Annotated[str, Path(pattern="^(offline|overdue|recovery)$")],
+):
     return service.run_task(db, actor=actor, name=name)
+
+
+# ---------------------------------------------------------------- 备件（V1.5）
+@router.get(
+    "/spare-parts",
+    summary="查询备件库存",
+    description="only_low=true 只看低于安全库存的备件；中心库对所有账号可见，场站库按授权过滤。",
+    response_model=PageResult[s.SparePartDetail],
+)
+def list_spare_parts(
+    db: Database, actor: CurrentActor, query: Annotated[s.PartQuery, Depends()]
+):
+    return service.list_spare_parts(db, actor=actor, query=query)
+
+
+@router.post(
+    "/part-usages",
+    summary="领用备件",
+    description="库存由数据库触发器扣减；数量不足返回 409，不会出现负库存。",
+    status_code=201,
+    response_model=s.PartUsageDetail,
+)
+def create_part_usage(db: Database, actor: CurrentActor, request: s.CreatePartUsageRequest):
+    return service.create_part_usage(db, actor=actor, request=request)
+
+
+@router.get(
+    "/part-usages",
+    summary="查询工单的备件领用记录",
+    response_model=list[s.PartUsageDetail],
+)
+def list_part_usages(
+    db: Database, actor: CurrentActor, work_order_id: Annotated[int, Query(gt=0)]
+):
+    return service.list_part_usages(db, actor=actor, work_order_id=work_order_id)
+
+
+@router.post(
+    "/incidents/{incident_id}/close",
+    summary="关闭应急事件",
+    status_code=204,
+)
+def close_incident(
+    db: Database,
+    actor: CurrentActor,
+    incident_id: Annotated[int, Path(gt=0)],
+    summary: Annotated[str, Query(min_length=2, max_length=1000, description="关闭说明")],
+):
+    emergency.close_incident(db, actor=actor, incident_id=incident_id, summary=summary)

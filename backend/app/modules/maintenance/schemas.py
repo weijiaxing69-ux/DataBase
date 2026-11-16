@@ -243,3 +243,41 @@ class ReadingAck(StrictModel):
     accepted: bool = True
     alert_generated: bool = False
     duplicate: bool = False
+
+
+# ---------------------------------------------------------------------------
+# 备件（V1.5 增量）
+# ---------------------------------------------------------------------------
+class PartQuery(PageQuery):
+    station_id: Optional[int] = None
+    only_low: bool = False
+
+
+class CreatePartUsageRequest(StrictModel):
+    work_order_id: int
+    part_id: int
+    qty: int = Field(gt=0, le=999)
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
+class SparePartDetail(StrictModel):
+    part_id: int
+    part_code: str
+    part_name: str
+    model: Optional[str]
+    unit: str
+    station_id: Optional[int]
+    stock_qty: int
+    safety_stock: int
+    status: str
+    low_stock: bool = False
+
+
+class PartUsageDetail(StrictModel):
+    usage_id: int
+    work_order_id: int
+    part_id: int
+    qty: int
+    used_at: datetime
+    used_by: int
+    note: Optional[str]

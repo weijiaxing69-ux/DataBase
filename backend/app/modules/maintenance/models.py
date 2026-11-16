@@ -190,3 +190,33 @@ class Notification(Base):
     content: Mapped[str] = mapped_column(String(1000), nullable=False)
     target_path: Mapped[str] = mapped_column(String(255), nullable=False)
     read_at: Mapped[Optional[datetime]] = mapped_column(DATETIME(fsp=3))
+
+
+class SparePart(Base):
+    """抢修备件（V1.5 增量表）。"""
+
+    __tablename__ = "spare_part"
+
+    part_id: Mapped[int] = mapped_column(PK, primary_key=True, autoincrement=True)
+    part_code: Mapped[str] = mapped_column(String(50), nullable=False)
+    part_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    model: Mapped[Optional[str]] = mapped_column(String(100))
+    unit: Mapped[str] = mapped_column(String(16), nullable=False, default="个")
+    station_id: Mapped[Optional[int]] = mapped_column(PK)
+    stock_qty: Mapped[int] = mapped_column(INTEGER(unsigned=True), nullable=False, default=0)
+    safety_stock: Mapped[int] = mapped_column(INTEGER(unsigned=True), nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+
+
+class PartUsage(Base):
+    """备件领用（V1.5 增量表）。"""
+
+    __tablename__ = "part_usage"
+
+    usage_id: Mapped[int] = mapped_column(PK, primary_key=True, autoincrement=True)
+    work_order_id: Mapped[int] = mapped_column(PK, nullable=False)
+    part_id: Mapped[int] = mapped_column(PK, nullable=False)
+    qty: Mapped[int] = mapped_column(INTEGER(unsigned=True), nullable=False)
+    used_at: Mapped[datetime] = mapped_column(DATETIME(fsp=3), nullable=False)
+    used_by: Mapped[int] = mapped_column(PK, nullable=False)
+    note: Mapped[Optional[str]] = mapped_column(String(500))

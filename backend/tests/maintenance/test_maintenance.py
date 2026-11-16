@@ -101,6 +101,28 @@ def _cleanup_alert_chain(db, alert_ids: list[int]) -> None:
     db.commit()
 
 
+def _purge_fault_code(db, fault_code: str) -> None:
+    """清理某个测试故障码产生的规则、告警与工单。"""
+    ids = [r[0] for r in db.execute(
+        text("select alert_id from device_alert where alert_code = :c"), {"c": fault_code}
+    ).all()]
+    for alert_id in ids:
+        _cleanup_alert_chain(db, [alert_id])
+    db.execute(text("delete from alarm_rule where fault_code = :c"), {"c": fault_code})
+    db.commit()
+
+
+def _clear_alert_work_orders(db, alert_id: int) -> None:
+    """清掉历史遗留工单，避免上一次失败运行的脏数据影响本次断言。"""
+    db.execute(text(
+        "delete from work_order_event where work_order_id in "
+        "(select work_order_id from work_order where alert_id = :a)"
+    ), {"a": alert_id})
+    db.execute(text("delete from work_order where alert_id = :a"), {"a": alert_id})
+    db.execute(text("update device_alert set status='processing' where alert_id = :a"), {"a": alert_id})
+    db.commit()
+
+
 def _make_alert(db, pile_id: int) -> tuple[int, datetime, DeviceActor]:
     """通过设备凭据上报采样触发告警，返回 (alert_id, sampled_at, device)。"""
     sampled_at = ms_now()
@@ -117,12 +139,28 @@ def _make_alert(db, pile_id: int) -> tuple[int, datetime, DeviceActor]:
         ),
     )
     alert_id = db.execute(
-        text(
-            "select alert_id from device_alert where pile_id = :p and alert_code = 'E104' "
-            "and status <> 'recovered' order by alert_id desc limit 1"
-        ),
+        text("select max(alert_id) from device_alert where pile_id = :p and alert_code = 'E104'"),
         {"p": pile_id},
     ).scalar_one()
+    _clear_alert_work_orders(db, alert_id)
+    return alert_id, sampled_at, device
+
+
+def _make_alert_with_code(db, pile_id: int, fault_code: str):
+    sampled_at = ms_now()
+    token, device = _issue_credential(db, pile_id)
+    service.ingest_device_reading(
+        db, device=device,
+        request=s.DeviceReadingRequest(
+            pile_id=pile_id, sampled_at=sampled_at, output_voltage_v=400,
+            output_current_a=10, power_kw=4, module_temperature_c=36, fault_code=fault_code,
+        ),
+    )
+    alert_id = db.execute(
+        text("select max(alert_id) from device_alert where pile_id = :p and alert_code = :c"),
+        {"p": pile_id, "c": fault_code},
+    ).scalar_one()
+    _clear_alert_work_orders(db, alert_id)
     return alert_id, sampled_at, device
 
 
@@ -166,8 +204,8 @@ def test_work_order_lifecycle(db):
     assert (wo.response_due_at - wo.assigned_at).total_seconds() == 7200  # low 规则 2 小时
 
     detail = wo
-    for event_type, offset in [("accepted", 60), ("arrived", 300), ("repaired", 900),
-                               ("review_passed", 1200), ("closed", 1500)]:
+    for event_type, offset in [("accepted", 5), ("arrived", 10), ("repaired", 15),
+                               ("review_passed", 20), ("closed", 25)]:
         detail = service.append_work_order_event(
             db, actor=ENGINEER, work_order_id=wo.work_order_id,
             request=s.WorkOrderEventRequest(
@@ -177,8 +215,8 @@ def test_work_order_lifecycle(db):
             ),
         )
     assert detail.status == "closed"
-    assert detail.accept_seconds == 60
-    assert detail.total_seconds == 1500
+    assert detail.accept_seconds == 5
+    assert detail.total_seconds == 25
 
     # 闭环后告警进入 recovering，观察期未满不直接 recovered
     status = db.execute(
@@ -396,3 +434,192 @@ def test_inspection_scope_filters_outsiders(db):
 def test_task_requires_admin(db):
     with pytest.raises(PermissionError):
         service.run_task(db, actor=ENGINEER, name="offline")
+
+
+# ---------------------------------------------------------------------------
+# 11. 闭环必须有复核通过记录（与存储过程口径一致）
+# ---------------------------------------------------------------------------
+def test_close_requires_review_passed(db):
+    pile_id = 13
+    alert_id, sampled_at, device = _make_alert(db, pile_id)
+    try:
+        wo = service.create_work_order(
+            db, actor=ADMIN, alert_id=alert_id,
+            request=s.CreateWorkOrderRequest(assigned_to=102),
+        )
+        base = wo.assigned_at
+        for event_type, offset in [("accepted", 10), ("arrived", 20), ("repaired", 30)]:
+            service.append_work_order_event(
+                db, actor=ENGINEER, work_order_id=wo.work_order_id,
+                request=s.WorkOrderEventRequest(event_type=event_type,
+                                                event_at=base + timedelta(seconds=offset)),
+            )
+        with pytest.raises(BusinessError) as err:
+            service.append_work_order_event(
+                db, actor=ENGINEER, work_order_id=wo.work_order_id,
+                request=s.WorkOrderEventRequest(event_type="closed",
+                                                event_at=base + timedelta(seconds=40)),
+            )
+        assert err.value.status_code == 409
+
+        service.append_work_order_event(
+            db, actor=ENGINEER, work_order_id=wo.work_order_id,
+            request=s.WorkOrderEventRequest(event_type="review_passed",
+                                            event_at=base + timedelta(seconds=50)),
+        )
+        detail = service.append_work_order_event(
+            db, actor=ENGINEER, work_order_id=wo.work_order_id,
+            request=s.WorkOrderEventRequest(event_type="closed",
+                                            event_at=base + timedelta(seconds=60)),
+        )
+        assert detail.status == "closed"
+    finally:
+        _cleanup_alert_chain(db, [alert_id])
+        db.execute(text("delete from device_reading where pile_id = :p and sampled_at = :t"),
+                   {"p": pile_id, "t": sampled_at})
+        _drop_credential(db, device)
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 12. 派单对象必须是运维/管理员
+# ---------------------------------------------------------------------------
+def test_assignee_must_be_engineer(db):
+    pile_id = 12
+    alert_id, sampled_at, device = _make_alert(db, pile_id)
+    try:
+        with pytest.raises(ValueError):
+            service.create_work_order(
+                db, actor=ADMIN, alert_id=alert_id,
+                request=s.CreateWorkOrderRequest(assigned_to=104),  # 车主账号
+            )
+    finally:
+        _cleanup_alert_chain(db, [alert_id])
+        db.execute(text("delete from device_reading where pile_id = :p and sampled_at = :t"),
+                   {"p": pile_id, "t": sampled_at})
+        _drop_credential(db, device)
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 13. 事件时间不能填未来（防伪造响应时限）
+# ---------------------------------------------------------------------------
+def test_future_event_rejected(db):
+    pile_id = 11
+    alert_id, sampled_at, device = _make_alert(db, pile_id)
+    try:
+        wo = service.create_work_order(
+            db, actor=ADMIN, alert_id=alert_id,
+            request=s.CreateWorkOrderRequest(assigned_to=102),
+        )
+        with pytest.raises(ValueError):
+            service.append_work_order_event(
+                db, actor=ENGINEER, work_order_id=wo.work_order_id,
+                request=s.WorkOrderEventRequest(
+                    event_type="accepted", event_at=utcnow() + timedelta(hours=2)
+                ),
+            )
+    finally:
+        _cleanup_alert_chain(db, [alert_id])
+        db.execute(text("delete from device_reading where pile_id = :p and sampled_at = :t"),
+                   {"p": pile_id, "t": sampled_at})
+        _drop_credential(db, device)
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 14. 恢复扫描：观察期满后 recovering → recovered
+# ---------------------------------------------------------------------------
+def test_recovery_task_promotes_alert(db):
+    from app.modules.maintenance import models as m
+
+    _purge_fault_code(db, "T-REC")
+    rule = m.AlarmRule(rule_code="T-REC-001", fault_code="T-REC", metric="fault_code",
+                       severity="low", response_seconds=60, recovery_seconds=1, enabled=1)
+    db.add(rule)
+    db.commit()
+    pile_id = 10
+    try:
+        alert_id, sampled_at, device = _make_alert_with_code(db, pile_id, "T-REC")
+        wo = service.create_work_order(db, actor=ADMIN, alert_id=alert_id,
+                                       request=s.CreateWorkOrderRequest(assigned_to=102))
+        base = wo.assigned_at
+        for event_type, offset in [("accepted", 5), ("arrived", 10), ("repaired", 15),
+                                   ("review_passed", 20)]:
+            service.append_work_order_event(
+                db, actor=ENGINEER, work_order_id=wo.work_order_id,
+                request=s.WorkOrderEventRequest(event_type=event_type,
+                                                event_at=base + timedelta(seconds=offset)),
+            )
+        service.append_work_order_event(
+            db, actor=ENGINEER, work_order_id=wo.work_order_id,
+            request=s.WorkOrderEventRequest(event_type="closed",
+                                            event_at=base + timedelta(seconds=25)),
+        )
+        assert db.execute(text("select status from device_alert where alert_id = :a"),
+                          {"a": alert_id}).scalar_one() == "recovering"
+
+        assert service.check_alert_recovery(db, now=base + timedelta(seconds=60)) >= 1
+        assert db.execute(text("select status from device_alert where alert_id = :a"),
+                          {"a": alert_id}).scalar_one() == "recovered"
+    finally:
+        db.execute(text("delete from device_reading where pile_id = :p"), {"p": pile_id})
+        _purge_fault_code(db, "T-REC")
+
+
+# ---------------------------------------------------------------------------
+# 15. KPI 按数据范围统计：无授权账号看到 0
+# ---------------------------------------------------------------------------
+def test_kpi_respects_scope(db):
+    outsider = Actor(account_id=999, roles=frozenset({"maintenance_engineer"}),
+                     permissions=frozenset({"maintenance.alert.read"}))
+    admin = service.overview(db, actor=ADMIN)["kpi"]
+    mine = service.overview(db, actor=outsider)["kpi"]
+    assert admin["open_alerts"] > 0
+    assert mine["open_alerts"] == 0
+    assert mine["open_orders"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 16. 备件领用：扣库存，超量返回 409
+# ---------------------------------------------------------------------------
+def test_part_usage_deducts_stock(db):
+    from app.modules.maintenance import models as m
+
+    db.execute(text("delete from spare_part where part_code = 'T-PART-001'"))
+    db.commit()
+    part = m.SparePart(part_code="T-PART-001", part_name="测试备件", unit="个",
+                       station_id=None, stock_qty=1, safety_stock=0, status="active")
+    db.add(part)
+    db.commit()
+    try:
+        with pytest.raises(BusinessError) as err:
+            service.create_part_usage(
+                db, actor=ADMIN,
+                request=s.CreatePartUsageRequest(work_order_id=901, part_id=part.part_id, qty=2),
+            )
+        assert err.value.status_code == 409
+
+        usage = service.create_part_usage(
+            db, actor=ADMIN,
+            request=s.CreatePartUsageRequest(work_order_id=901, part_id=part.part_id, qty=1),
+        )
+        assert usage.qty == 1
+        stock = db.execute(text("select stock_qty from spare_part where part_id = :p"),
+                           {"p": part.part_id}).scalar_one()
+        assert stock == 0
+    finally:
+        db.execute(text("delete from part_usage where part_id = :p"), {"p": part.part_id})
+        db.execute(text("delete from spare_part where part_id = :p"), {"p": part.part_id})
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 17. 报障关联告警必须给 alert_id
+# ---------------------------------------------------------------------------
+def test_fault_report_linked_requires_alert(db):
+    with pytest.raises(ValueError):
+        service.handle_fault_report(
+            db, actor=ADMIN, report_id=901,
+            request=s.HandleFaultReportRequest(status="linked", alert_id=None),
+        )

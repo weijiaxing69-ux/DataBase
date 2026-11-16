@@ -13,7 +13,14 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.errors import BusinessError
-from app.modules.maintenance.service import PERM_ALERT_READ, PERM_ASSIGN, _require, _tx, utcnow
+from app.modules.maintenance.service import (
+    PERM_ALERT_READ,
+    PERM_ASSIGN,
+    PERM_INCIDENT,
+    _require,
+    _tx,
+    utcnow,
+)
 from app.shared.contracts import Actor
 
 
@@ -28,7 +35,7 @@ def declare_incident(
     title: str,
     alert_id: Optional[int] = None,
 ) -> int:
-    _require(actor, PERM_ASSIGN)
+    _require(actor, PERM_INCIDENT, PERM_ASSIGN)
     if category not in {"power", "communication", "hardware", "software", "security", "other"}:
         raise ValueError("根因类别不合法")
     if severity not in {"P1", "P2", "P3", "P4"}:
@@ -56,7 +63,7 @@ def declare_incident(
 
 def escalate_incidents(db: Session, *, actor: Actor, now: Optional[datetime] = None) -> int:
     """升级扫描，返回本轮新增的升级记录数。供调度器每分钟调用。"""
-    _require(actor, PERM_ASSIGN)
+    _require(actor, PERM_INCIDENT, PERM_ASSIGN)
     now = now or utcnow()
     with _tx(db):
         before = db.execute(text("select count(*) from incident_escalation")).scalar_one()
@@ -66,7 +73,7 @@ def escalate_incidents(db: Session, *, actor: Actor, now: Optional[datetime] = N
 
 
 def close_incident(db: Session, *, actor: Actor, incident_id: int, summary: str) -> None:
-    _require(actor, PERM_ASSIGN)
+    _require(actor, PERM_INCIDENT, PERM_ASSIGN)
     with _tx(db):
         exists = db.execute(
             text("select count(*) from incident where incident_id = :iid"), {"iid": incident_id}
@@ -80,7 +87,7 @@ def close_incident(db: Session, *, actor: Actor, incident_id: int, summary: str)
 
 
 def list_incident_board(db: Session, *, actor: Actor, limit: int = 50):
-    _require(actor, PERM_ALERT_READ, PERM_ASSIGN)
+    _require(actor, PERM_ALERT_READ, PERM_INCIDENT, PERM_ASSIGN)
     rows = db.execute(
         text(
             """select incident_id, incident_no, severity, status, station_name,
