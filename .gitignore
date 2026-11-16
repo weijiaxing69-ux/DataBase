@@ -1,0 +1,9 @@
+.venv/
+.idea/
+.swagger-vendor/
+__pycache__/
+.pytest_cache/
+frontend/node_modules/
+frontend/dist/
+demo-login.txt
+test-results.txt
