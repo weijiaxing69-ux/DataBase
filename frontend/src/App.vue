@@ -173,7 +173,7 @@ onUnmounted(() => {
       <label>密码<input v-model="credentials.password" name="password" type="password" autocomplete="current-password" required placeholder="输入密码"></label>
       <p v-if="error" role="alert" class="error">{{ error }}</p>
       <button class="primary login-button" :disabled="busy">{{ busy ? '登录中…' : '登录' }}</button>
-      <div class="demo-hint">演示账号：platform_admin<br>演示密码：Demo123!<br>数据仅用于本机演示，重启服务后清空。</div>
+      <div class="demo-hint">MySQL 演示库：platform_admin_demo / ChargeDemo-2026!<br>内存演示模式：platform_admin / Demo123!<br>数据仅用于本机演示。</div>
     </form>
   </main>
   <div v-else class="workspace">
