@@ -220,3 +220,18 @@ class PartUsage(Base):
     used_at: Mapped[datetime] = mapped_column(DATETIME(fsp=3), nullable=False)
     used_by: Mapped[int] = mapped_column(PK, nullable=False)
     note: Mapped[Optional[str]] = mapped_column(String(500))
+
+
+class PartStockMovement(Base):
+    """备件库存流水（V1.5 增量表）。"""
+
+    __tablename__ = "part_stock_movement"
+
+    movement_id: Mapped[int] = mapped_column(PK, primary_key=True, autoincrement=True)
+    part_id: Mapped[int] = mapped_column(PK, nullable=False)
+    movement_type: Mapped[str] = mapped_column(String(8), nullable=False)
+    qty: Mapped[int] = mapped_column(INTEGER(unsigned=True), nullable=False)
+    balance_after: Mapped[int] = mapped_column(INTEGER(unsigned=True), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DATETIME(fsp=3), nullable=False)
+    operator_account_id: Mapped[Optional[int]] = mapped_column(PK)
+    note: Mapped[Optional[str]] = mapped_column(String(255))

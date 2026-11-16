@@ -4,12 +4,13 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import {
   getOverview, listAlerts, listWorkOrders, listWorkOrderEvents,
-  appendWorkOrderEvent, listIncidents, runTask,
+  appendWorkOrderEvent, listIncidents, runTask, listSpareParts,
 } from '../../api/maintenance'
 
 const overview = ref(null)
 const alerts = ref([])
 const incidents = ref([])
+const lowParts = ref([])
 const selected = ref(null)
 const orders = ref([])
 const events = ref({})
@@ -108,11 +109,12 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    const [overviewData, incidentList] = await Promise.all([
-      getOverview(), listIncidents(), loadAlerts(),
+    const [overviewData, incidentList, , parts] = await Promise.all([
+      getOverview(), listIncidents(), loadAlerts(), listSpareParts({ only_low: true, page_size: 5 }),
     ])
     overview.value = overviewData
     incidents.value = incidentList || []
+    lowParts.value = parts.items || []
     updatedAt.value = new Date().toLocaleTimeString('zh-CN', { hour12: false })
   } catch (e) {
     error.value = e.message
@@ -357,6 +359,16 @@ onUnmounted(() => {
       </section>
 
       <section class="panel mt-incidents">
+        <header class="mt-card-head"><h2>备件紧张</h2><span class="mt-tag">低于安全库存</span></header>
+        <p v-if="!lowParts.length" class="mt-empty" style="padding:18px 20px">库存充足</p>
+        <article v-for="part in lowParts" :key="part.part_id" class="mt-part">
+          <div>
+            <strong>{{ part.part_name }}</strong>
+            <small>{{ part.part_code }}<span v-if="part.station_id"> · 场站 {{ part.station_id }}</span></small>
+          </div>
+          <span class="mt-part-qty">{{ part.stock_qty }}<em>/{{ part.safety_stock }}</em></span>
+        </article>
+
         <header class="mt-card-head"><h2>应急事件</h2><span class="mt-tag">按时间倒序</span></header>
         <p v-if="!incidents.length" class="mt-empty">暂无事件</p>
         <article v-for="item in incidents.slice(0, 5)" :key="item.incident_id" class="mt-incident">

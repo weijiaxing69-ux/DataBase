@@ -330,7 +330,8 @@ def notify(
         content=content,
         target_path=target_path,
     )
-    db.execute(stmt.prefix_with("IGNORE"))
+    result = db.execute(stmt.prefix_with("IGNORE"))
+    return result.rowcount > 0
 
 
 # ---------------------------------------------------------------------------
@@ -729,3 +730,95 @@ def open_work_order_for_alert(db: Session, alert_id: int):
             m.WorkOrder.alert_id == alert_id, m.WorkOrder.status != "closed"
         ).order_by(m.WorkOrder.work_order_id.desc()).limit(1)
     ).scalar_one_or_none()
+
+
+# ---------------------------------------------------------------------------
+# 库存流水、巡检到期、绩效统计
+# ---------------------------------------------------------------------------
+def list_part_movements(db: Session, part_id: int, limit: int = 100):
+    return list(
+        db.execute(
+            select(m.PartStockMovement)
+            .where(m.PartStockMovement.part_id == part_id)
+            .order_by(m.PartStockMovement.occurred_at.desc())
+            .limit(limit)
+        ).scalars()
+    )
+
+
+def add_movement(
+    db: Session, *, part_id: int, movement_type: str, qty: int,
+    balance_after: int, occurred_at, operator_account_id: Optional[int], note: Optional[str],
+) -> m.PartStockMovement:
+    row = m.PartStockMovement(
+        part_id=part_id, movement_type=movement_type, qty=qty,
+        balance_after=balance_after, occurred_at=occurred_at,
+        operator_account_id=operator_account_id, note=note,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def list_piles_due_inspection(db: Session, since):
+    """活跃桩中，最近一次巡检早于 since 的（含从未巡检的）。"""
+    return db.execute(
+        text(
+            """select p.pile_id, p.station_id,
+                      (select max(i.inspected_at) from inspection_record i where i.pile_id = p.pile_id) as last_at
+                 from charging_pile p
+                where p.lifecycle_status = 'active'
+                  and not exists (
+                        select 1 from inspection_record i
+                         where i.pile_id = p.pile_id and i.inspected_at >= :since)
+                order by p.pile_id"""
+        ),
+        {"since": since},
+    ).mappings().all()
+
+
+def operator_performance(db: Session, account_id: Optional[int]):
+    rows = db.execute(
+        text(
+            f"""select w.assigned_to,
+                       count(*) as orders,
+                       sum(w.status = 'closed') as closed_orders,
+                       sum(w.status = 'assigned' and w.response_due_at < utc_timestamp()) as overdue_orders,
+                       avg(case when acc.accepted_at is not null
+                                then timestampdiff(second, w.assigned_at, acc.accepted_at) end) as avg_accept,
+                       avg(case when clo.closed_at is not null
+                                then timestampdiff(second, w.assigned_at, clo.closed_at) end) as avg_close
+                  from work_order w
+                  left join (select work_order_id, min(event_at) accepted_at
+                               from work_order_event where event_type = 'accepted'
+                              group by work_order_id) acc on acc.work_order_id = w.work_order_id
+                  left join (select work_order_id, min(event_at) closed_at
+                               from work_order_event where event_type = 'closed'
+                              group by work_order_id) clo on clo.work_order_id = w.work_order_id
+                 where {_scope('(select da.pile_id from device_alert da where da.alert_id = w.alert_id)', account_id)}
+                 group by w.assigned_to
+                 order by orders desc"""
+        ),
+        {"aid": account_id},
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def station_performance(db: Session, account_id: Optional[int], limit: int = 20):
+    rows = db.execute(
+        text(
+            f"""select s.station_id, s.station_name,
+                       count(a.alert_id) as alerts,
+                       avg(case when a.recovered_at is not null
+                                then timestampdiff(second, a.occurred_at, a.recovered_at) end) as avg_recovery
+                  from device_alert a
+                  join charging_pile p on p.pile_id = a.pile_id
+                  join station s on s.station_id = p.station_id
+                 where {_scope('a.pile_id', account_id)}
+                 group by s.station_id, s.station_name
+                 order by alerts desc
+                 limit :lim"""
+        ),
+        {"aid": account_id, "lim": limit},
+    ).mappings().all()
+    return [dict(r) for r in rows]

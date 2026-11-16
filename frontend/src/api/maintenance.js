@@ -35,6 +35,14 @@ export const listInspections = params => http.get('/maintenance/inspections', { 
 export const getInspection = id => http.get(`/maintenance/inspections/${id}`)
 export const createInspection = data => http.post('/maintenance/inspections', data)
 
+// ---------------- 备件（V1.5） ----------------
+export const listSpareParts = params => http.get('/maintenance/spare-parts', { params })
+export const stockInPart = data => http.post('/maintenance/part-stock-ins', data)
+export const listPartMovements = partId => http.get('/maintenance/part-movements', { params: { part_id: partId } })
+
+// ---------------- 绩效统计 ----------------
+export const getPerformance = () => http.get('/maintenance/stats/performance')
+
 // ---------------- 应急事件（V1.5） ----------------
 export const listIncidents = () => http.get('/maintenance/incidents')
 export const declareIncident = params => http.post('/maintenance/incidents', null, { params })

@@ -768,3 +768,86 @@ TASKS = {
     "safety": auto_dispatch_safety_alerts,
     "recurring": escalate_recurring_faults,
 }
+
+
+# ---------------------------------------------------------------------------
+# 备件入库、巡检到期、绩效统计
+# ---------------------------------------------------------------------------
+def stock_in_part(db: Session, *, actor: Actor, request: s.StockInRequest):
+    """备件入库：库存增加并记一条流水。"""
+    _require(actor, PERM_HANDLE, PERM_ASSIGN)
+    with _tx(db):
+        part = dao.get_spare_part(db, request.part_id, for_update=True)
+        if part is None:
+            raise BusinessError("备件不存在", status_code=404)
+        if part.station_id is not None:
+            security.assert_resource_scope(db, actor, resource_type="station", resource_id=part.station_id)
+        part.stock_qty += request.qty
+        row = dao.add_movement(
+            db, part_id=part.part_id, movement_type="in", qty=request.qty,
+            balance_after=part.stock_qty, occurred_at=utcnow(),
+            operator_account_id=actor.account_id, note=request.note,
+        )
+        return s.PartMovementDetail.model_validate(row)
+
+
+def list_part_movements(db: Session, *, actor: Actor, part_id: int):
+    _require(actor, PERM_HANDLE, PERM_INSPECT_READ, PERM_ASSIGN)
+    part = dao.get_spare_part(db, part_id)
+    if part is None:
+        raise BusinessError("备件不存在", status_code=404)
+    if part.station_id is not None:
+        security.assert_resource_scope(db, actor, resource_type="station", resource_id=part.station_id)
+    return [s.PartMovementDetail.model_validate(r) for r in dao.list_part_movements(db, part_id)]
+
+
+def check_inspection_due(db: Session, *, now: Optional[datetime] = None, days: int = 30) -> int:
+    """活跃桩超过 N 天没巡检：给场站值班发待办，按月去重。"""
+    now = now or utcnow()
+    month = now.strftime("%Y-%m")
+    created = 0
+    with _tx(db):
+        for row in dao.list_piles_due_inspection(db, now - timedelta(days=days)):
+            account_id, _ = dao.on_call_accounts(db, row["station_id"], now)
+            if dao.notify(
+                db,
+                account_id=account_id,
+                notification_type="inspection_due",
+                business_key=f"inspect_due:{row['pile_id']}:{month}",
+                title="巡检到期",
+                content=f"桩 #{row['pile_id']} 已超过 {days} 天未巡检，请安排现场检查",
+                target_path="/maintenance/inspections",
+            ):
+                created += 1
+        db.flush()
+    return created
+
+
+def performance_stats(db: Session, *, actor: Actor):
+    """按处理人与场站统计：工单量、接单/闭环耗时、超时单数。"""
+    _require(actor, PERM_HANDLE, PERM_ASSIGN, PERM_ALERT_READ)
+    account_id = _scope_account(actor)
+    operators = [
+        s.OperatorPerformance(
+            assigned_to=row["assigned_to"],
+            orders=int(row["orders"]),
+            closed_orders=int(row["closed_orders"] or 0),
+            overdue_orders=int(row["overdue_orders"] or 0),
+            avg_accept_seconds=float(row["avg_accept"]) if row["avg_accept"] is not None else None,
+            avg_close_seconds=float(row["avg_close"]) if row["avg_close"] is not None else None,
+        )
+        for row in dao.operator_performance(db, account_id)
+    ]
+    stations = [
+        s.StationPerformance(
+            station_id=row["station_id"],
+            station_name=row["station_name"],
+            alerts=int(row["alerts"]),
+            avg_recovery_seconds=float(row["avg_recovery"]) if row["avg_recovery"] is not None else None,
+        )
+        for row in dao.station_performance(db, account_id)
+    ]
+    return s.PerformanceStats(operators=operators, stations=stations, generated_at=utcnow())
+
+
+TASKS["inspection"] = check_inspection_due

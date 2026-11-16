@@ -934,3 +934,63 @@ def test_recurring_fault_escalates_work_order(db):
     finally:
         _cleanup_alert_chain(db, [a.alert_id for a in alerts])
         db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 25. 备件入库：库存增加并留下流水
+# ---------------------------------------------------------------------------
+def test_stock_in_records_movement(db):
+    from app.modules.maintenance import models as m
+
+    db.execute(text("delete from part_stock_movement where note = '测试入库'"))
+    db.execute(text("delete from spare_part where part_code = 'T-PART-004'"))
+    db.commit()
+    part = m.SparePart(part_code="T-PART-004", part_name="测试备件4", unit="个",
+                       station_id=None, stock_qty=0, safety_stock=1, status="active")
+    db.add(part)
+    db.commit()
+    try:
+        movement = service.stock_in_part(
+            db, actor=ADMIN,
+            request=s.StockInRequest(part_id=part.part_id, qty=5, note="测试入库"),
+        )
+        assert movement.movement_type == "in" and movement.balance_after == 5
+        assert db.execute(text("select stock_qty from spare_part where part_id = :p"),
+                          {"p": part.part_id}).scalar_one() == 5
+
+        rows = service.list_part_movements(db, actor=ADMIN, part_id=part.part_id)
+        assert len(rows) == 1 and rows[0].qty == 5
+    finally:
+        db.execute(text("delete from part_stock_movement where part_id = :p"), {"p": part.part_id})
+        db.execute(text("delete from spare_part where part_id = :p"), {"p": part.part_id})
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 26. 巡检到期：给场站发待办，同月不重复
+# ---------------------------------------------------------------------------
+def test_inspection_due_notifies_once_per_month(db):
+    db.execute(text("delete from notification where notification_type = 'inspection_due'"))
+    db.commit()
+    now = utcnow()
+    try:
+        created = service.check_inspection_due(db, now=now, days=30)
+        assert created >= 1
+        # 再跑一次：本月已通知过，不应重复发
+        assert service.check_inspection_due(db, now=now, days=30) == 0
+    finally:
+        db.execute(text("delete from notification where notification_type = 'inspection_due'"))
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 27. 绩效统计：按处理人与场站聚合
+# ---------------------------------------------------------------------------
+def test_performance_stats_shape(db):
+    stats = service.performance_stats(db, actor=ADMIN)
+    assert stats.operators, "应有处理人统计"
+    first = stats.operators[0]
+    assert first.orders >= first.closed_orders >= 0
+    assert first.avg_accept_seconds is None or first.avg_accept_seconds >= 0
+    assert stats.stations, "应有场站统计"
+    assert stats.stations[0].alerts >= 0

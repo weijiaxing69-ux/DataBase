@@ -348,6 +348,16 @@ def stats_overview(db: Database, actor: CurrentActor):
     return service.overview(db, actor=actor)
 
 
+@router.get(
+    "/stats/performance",
+    summary="运维绩效统计",
+    description="按处理人统计工单量、接单/闭环平均耗时、超时单数；按场站统计告警量与平均恢复时长。",
+    response_model=s.PerformanceStats,
+)
+def stats_performance(db: Database, actor: CurrentActor):
+    return service.performance_stats(db, actor=actor)
+
+
 @router.post(
     "/tasks/{name}/run",
     summary="手动触发一次后台任务",
@@ -356,7 +366,7 @@ def stats_overview(db: Database, actor: CurrentActor):
 def run_task(
     db: Database,
     actor: CurrentActor,
-    name: Annotated[str, Path(pattern="^(offline|overdue|recovery|charging|safety|recurring)$")],
+    name: Annotated[str, Path(pattern="^(offline|overdue|recovery|charging|safety|recurring|inspection)$")],
 ):
     return service.run_task(db, actor=actor, name=name)
 
@@ -383,6 +393,28 @@ def list_spare_parts(
 )
 def create_part_usage(db: Database, actor: CurrentActor, request: s.CreatePartUsageRequest):
     return service.create_part_usage(db, actor=actor, request=request)
+
+
+@router.post(
+    "/part-stock-ins",
+    summary="备件入库",
+    description="库存增加并记一条流水；场站仓需有该场站授权。",
+    status_code=201,
+    response_model=s.PartMovementDetail,
+)
+def stock_in_part(db: Database, actor: CurrentActor, request: s.StockInRequest):
+    return service.stock_in_part(db, actor=actor, request=request)
+
+
+@router.get(
+    "/part-movements",
+    summary="查询备件出入库流水",
+    response_model=list[s.PartMovementDetail],
+)
+def list_part_movements(
+    db: Database, actor: CurrentActor, part_id: Annotated[int, Query(gt=0)]
+):
+    return service.list_part_movements(db, actor=actor, part_id=part_id)
 
 
 @router.get(

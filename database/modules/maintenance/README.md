@@ -29,6 +29,7 @@ mysql -u root -h 127.0.0.1 charging_platform_test < 05_seed_scenarios.sql
 | `16_indexes.sql` | 列表排序索引（告警时间、工单派单时间、巡检时间） |
 | `17_security_hardening.sql` | 补齐 6 个 maintenance 权限码并授权；采样表加 (pile_id, sampled_at) 唯一键 |
 | `18_charging_anomaly_rule.sql` | 充电中断识别规则（CHG01，high，30 分钟响应） |
+| `19_part_stock_movement.sql` | 备件出入库流水表 + 历史领用补录 |
 
 ## 现场问题识别（后台任务）
 
@@ -37,6 +38,7 @@ mysql -u root -h 127.0.0.1 charging_platform_test < 05_seed_scenarios.sql
 | `check_charging_anomaly` | 订单在充电中但功率持续接近 0（跳枪、枪锁松脱、BMS 中断） |
 | `auto_dispatch_safety_alerts` | 严重级告警自动停机并派单 |
 | `escalate_recurring_faults` | 同桩同码 30 天内 ≥3 次，升级在办工单 |
+| `check_inspection_due` | 活跃桩超 30 天未巡检，给场站发待办（按月去重） |
 
 调度器每分钟调用；也可通过 `POST /api/v1/maintenance/tasks/{name}/run` 手动触发（仅管理员）。
 

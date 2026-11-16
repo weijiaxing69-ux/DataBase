@@ -281,3 +281,42 @@ class PartUsageDetail(StrictModel):
     used_at: datetime
     used_by: int
     note: Optional[str]
+
+
+class StockInRequest(StrictModel):
+    part_id: int
+    qty: int = Field(gt=0, le=9999)
+    note: Optional[str] = Field(default=None, max_length=255)
+
+
+class PartMovementDetail(StrictModel):
+    movement_id: int
+    part_id: int
+    movement_type: str
+    qty: int
+    balance_after: int
+    occurred_at: datetime
+    operator_account_id: Optional[int]
+    note: Optional[str]
+
+
+class OperatorPerformance(StrictModel):
+    assigned_to: int
+    orders: int
+    closed_orders: int
+    overdue_orders: int
+    avg_accept_seconds: float | None
+    avg_close_seconds: float | None
+
+
+class StationPerformance(StrictModel):
+    station_id: int
+    station_name: str
+    alerts: int
+    avg_recovery_seconds: float | None
+
+
+class PerformanceStats(StrictModel):
+    operators: list[OperatorPerformance]
+    stations: list[StationPerformance]
+    generated_at: datetime
