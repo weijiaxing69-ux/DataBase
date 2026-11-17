@@ -226,7 +226,14 @@ def update_alarm_rule(
 def list_alerts(db: Session, *, actor: Actor, query: s.AlertQuery) -> PageResult[s.AlertDetail]:
     _require(actor, PERM_ALERT_READ, PERM_HANDLE)
     rows, total = dao.list_alerts(db, query, account_id=_scope_account(actor))
-    return _list_page([s.AlertDetail.model_validate(r) for r in rows], total, query)
+    now = utcnow()
+    items = []
+    for row in rows:
+        detail = s.AlertDetail.model_validate(row)
+        due = row.occurred_at + timedelta(seconds=row.response_seconds_snapshot)
+        detail.is_overdue = row.status != "recovered" and now > due
+        items.append(detail)
+    return _list_page(items, total, query)
 
 
 def get_alert(db: Session, *, actor: Actor, alert_id: int) -> s.AlertDetail:
@@ -448,6 +455,12 @@ def handle_fault_report(
             raise BusinessError("报障已处理完毕", status_code=409)
         if request.status == "linked" and request.alert_id is None:
             raise ValueError("关联告警时必须提供 alert_id")
+        if request.alert_id is not None:
+            alert = dao.get_alert(db, request.alert_id)
+            if alert is None:
+                raise BusinessError("关联的告警不存在", status_code=404)
+            if dao.gun_pile_id(db, row.gun_id) != alert.pile_id:
+                raise BusinessError("告警与报障不在同一根桩，不能关联", status_code=409)
         row.status = request.status
         row.handled_by = actor.account_id
         row.handled_at = utcnow()
@@ -479,6 +492,8 @@ def create_inspection(db: Session, *, actor: Actor, request: s.CreateInspectionR
         if pile is None:
             raise BusinessError("充电桩不存在", status_code=404)
         _scope_pile(db, actor, pile.pile_id)
+        if request.inspected_at and request.inspected_at > utcnow() + timedelta(minutes=5):
+            raise ValueError("巡检时间不能晚于当前时间")
         row = dao.create_inspection(db, actor_id=actor.account_id, payload=request)
         return s.InspectionDetail.model_validate(row)
 

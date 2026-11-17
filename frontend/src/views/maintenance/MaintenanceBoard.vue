@@ -29,12 +29,22 @@ let toastTimer = null
 const LEVEL = { critical: '严重', high: '高', medium: '中', low: '低' }
 const LEVEL_COLOR = { critical: '#b3452f', high: '#b9762a', medium: '#9a8124', low: '#6d7d74' }
 const ALERT_STATUS = { open: '未处理', processing: '处理中', recovering: '恢复观察', recovered: '已恢复' }
+const ALERT_CODE = { CHG01: '充电中断', TEMP01: '高温预警', MET01: '计量异常', E101: '绝缘故障' }
+const codeName = code => ALERT_CODE[code]
+  || (/^SCN-TEMP/.test(code) ? '温度超限' : /^E\d/.test(code) ? '设备故障' : code)
 const WO_STATUS = { assigned: '待接单', accepted: '已接单', arrived: '已到场', repaired: '已修复', closed: '已闭环' }
 const INC_STATUS = { detected: '已发现', declared: '已宣布', contained: '已受控', restored: '已恢复', reviewed: '已复盘', closed: '已关闭', cancelled: '已取消' }
 const EVT = { accepted: '接单', arrived: '到场', repaired: '修复', review_passed: '复核通过', review_failed: '复核未通过', closed: '闭环', escalated: '超时升级' }
 
 const kpi = computed(() => overview.value?.kpi || {})
+const alertFilter = ref('all')
 const openAlerts = computed(() => alerts.value.filter(a => a.status !== 'recovered'))
+const overdueCount = computed(() => alerts.value.filter(a => a.is_overdue).length)
+const visibleAlerts = computed(() => {
+  if (alertFilter.value === 'open') return openAlerts.value
+  if (alertFilter.value === 'overdue') return alerts.value.filter(a => a.is_overdue)
+  return alerts.value
+})
 const pageCount = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
 
 // 30 天趋势：折线 + 面积 + 网格
@@ -328,8 +338,15 @@ onUnmounted(() => {
     <div class="mt-row">
       <section class="panel mt-table-card">
         <header class="mt-card-head">
-          <div><h2>最近告警</h2><p class="muted">共 {{ total }} 条，本页未恢复 {{ openAlerts.length }} 条 · 点击行可处置</p></div>
-          <span class="mt-tag">实时</span>
+          <div>
+            <h2>最近告警</h2>
+            <p class="muted">共 {{ total }} 条 · 本页未恢复 {{ openAlerts.length }} · 超时 {{ overdueCount }}</p>
+          </div>
+          <div class="mt-tabs">
+            <button :class="{ on: alertFilter === 'all' }" @click="alertFilter = 'all'">全部</button>
+            <button :class="{ on: alertFilter === 'open' }" @click="alertFilter = 'open'">未恢复</button>
+            <button :class="{ on: alertFilter === 'overdue' }" @click="alertFilter = 'overdue'">已超时</button>
+          </div>
         </header>
         <div class="table-scroll">
           <table class="mt-table">
@@ -338,16 +355,24 @@ onUnmounted(() => {
               <template v-if="loading">
                 <tr v-for="i in 5" :key="'sk' + i"><td colspan="6"><div class="mt-skeleton mt-skeleton-row"></div></td></tr>
               </template>
-              <tr v-else-if="!alerts.length"><td colspan="6" class="mt-empty">暂无告警，设备运行正常</td></tr>
-              <tr v-for="alert in alerts" v-else :key="alert.alert_id" class="mt-click" @click="openAlert(alert)">
+              <tr v-else-if="!visibleAlerts.length"><td colspan="6" class="mt-empty">
+                {{ alertFilter === 'overdue' ? '当前页没有超时告警' : alertFilter === 'open' ? '当前页告警都已恢复' : '暂无告警，设备运行正常' }}
+              </td></tr>
+              <tr v-for="alert in visibleAlerts" v-else :key="alert.alert_id" class="mt-click" @click="openAlert(alert)">
                 <td>
                   <span class="mt-level" :class="alert.severity">
                     <i></i>{{ LEVEL[alert.severity] || alert.severity }}
                   </span>
                 </td>
                 <td class="mt-mono">#{{ alert.pile_id }}<span v-if="alert.gun_id" class="mt-sub"> / 枪 {{ alert.gun_id }}</span></td>
-                <td class="mt-mono">{{ alert.alert_code }}</td>
-                <td><span class="mt-status" :class="alert.status">{{ ALERT_STATUS[alert.status] || alert.status }}</span></td>
+                <td>
+                  <span class="mt-code">{{ codeName(alert.alert_code) }}</span>
+                  <span class="mt-code-sub">{{ alert.alert_code }}</span>
+                </td>
+                <td>
+                  <span class="mt-status" :class="alert.status">{{ ALERT_STATUS[alert.status] || alert.status }}</span>
+                  <span v-if="alert.is_overdue" class="mt-overdue">超时</span>
+                </td>
                 <td class="mt-time">{{ hm(alert.occurred_at) }}</td>
                 <td class="mt-time">{{ alert.status === 'recovered' ? '—' : duration(alert.occurred_at) }}</td>
               </tr>
@@ -520,6 +545,15 @@ onUnmounted(() => {
 .mt-rank-bar { height: 5px; background: #f1f5f1; border-radius: 3px; overflow: hidden; }
 .mt-rank-bar span { display: block; height: 100%; background: #7fb494; border-radius: 3px; }
 
+.mt-tabs { display: flex; gap: 6px; }
+.mt-tabs button { font-size: 12px; padding: 5px 12px; border-radius: 999px;
+  border: 1px solid #dfe7e1; background: #fff; color: #6c7d73; }
+.mt-tabs button.on { background: #17654c; border-color: #17654c; color: #fff; }
+.mt-code { display: block; font-size: 13px; color: #2b3f37; }
+.mt-code-sub { display: block; font-family: Consolas, monospace; font-size: 11px; color: #9aa8b5;
+  max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mt-overdue { display: inline-block; margin-left: 6px; font-size: 11px; color: #a13c28;
+  background: #fbeae6; border-radius: 4px; padding: 2px 6px; }
 .mt-table-card { padding-bottom: 8px; }
 .mt-table { width: 100%; }
 .mt-table th { background: #f8faf8; }

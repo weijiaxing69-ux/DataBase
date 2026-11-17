@@ -883,3 +883,9 @@ def list_occupied_without_order(db: Session, before):
         {"before": before},
     ).mappings().all()
     return [dict(r) for r in rows]
+
+
+def gun_pile_id(db: Session, gun_id: int) -> Optional[int]:
+    return db.execute(
+        text("select pile_id from charging_gun where gun_id = :g"), {"g": gun_id}
+    ).scalar_one_or_none()

@@ -1123,3 +1123,67 @@ def test_task_item_failure_does_not_abort_batch(db, monkeypatch):
         db.execute(text("update charging_pile set status='idle', has_fault=0 where pile_id in (4,5)"))
         db.execute(text("delete from device_status_log where pile_id in (4,5) and reason like 'critical alert%'"))
         db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 32. 报障关联告警：必须存在且同一根桩
+# ---------------------------------------------------------------------------
+def test_fault_report_link_requires_same_pile(db):
+    pile_id, gun_id = db.execute(text(
+        "select p.pile_id, g.gun_id from charging_pile p join charging_gun g on g.pile_id = p.pile_id "
+        "where p.pile_id <= 5 order by g.gun_id limit 1"
+    )).one()
+    other_alert = db.execute(text(
+        "select alert_id from device_alert where pile_id <> :p limit 1"
+    ), {"p": pile_id}).scalar_one()
+
+    db.execute(text("delete from fault_report where description = '测试报障-同桩校验'"))
+    db.execute(text(
+        "insert into fault_report (user_id, gun_id, description, status) "
+        "values (1, :g, '测试报障-同桩校验', 'submitted')"
+    ), {"g": gun_id})
+    db.commit()
+    report_id = db.execute(text(
+        "select report_id from fault_report where description = '测试报障-同桩校验'"
+    )).scalar_one()
+    try:
+        with pytest.raises(BusinessError) as mismatch:
+            service.handle_fault_report(
+                db, actor=ADMIN, report_id=report_id,
+                request=s.HandleFaultReportRequest(status="linked", alert_id=other_alert),
+            )
+        assert mismatch.value.status_code == 409
+
+        with pytest.raises(BusinessError) as missing:
+            service.handle_fault_report(
+                db, actor=ADMIN, report_id=report_id,
+                request=s.HandleFaultReportRequest(status="linked", alert_id=999999),
+            )
+        assert missing.value.status_code == 404
+    finally:
+        db.execute(text("delete from fault_report where report_id = :r"), {"r": report_id})
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 33. 巡检时间不能填未来
+# ---------------------------------------------------------------------------
+def test_inspection_rejects_future_time(db):
+    with pytest.raises(ValueError):
+        service.create_inspection(
+            db, actor=ADMIN,
+            request=s.CreateInspectionRequest(
+                pile_id=1, inspected_at=utcnow() + timedelta(days=1),
+                result="normal", note="未来时间测试",
+            ),
+        )
+
+
+# ---------------------------------------------------------------------------
+# 34. 告警列表直接带超时标记
+# ---------------------------------------------------------------------------
+def test_alert_list_has_overdue_flag(db):
+    page = service.list_alerts(db, actor=ADMIN, query=s.AlertQuery(page=1, page_size=5))
+    assert page.items
+    for item in page.items:
+        assert isinstance(item.is_overdue, bool)
