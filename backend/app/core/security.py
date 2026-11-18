@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException
 from cryptography.exceptions import InvalidKey
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
-from sqlalchemy import BigInteger, Column, DateTime, Integer, LargeBinary, MetaData, String, Table, select
+from sqlalchemy import BigInteger, Column, DateTime, Integer, LargeBinary, MetaData, String, Table, select, text
 
 from app.core.config import settings
 from app.core.database import SessionLocal
@@ -87,7 +87,13 @@ def _actor(db, account_id: int) -> Actor:
         .join(role_permissions, permissions.c.permission_id == role_permissions.c.permission_id)
         .join(account_roles, account_roles.c.role_id == role_permissions.c.role_id)
         .where(account_roles.c.account_id == account_id)).all()
-    return Actor(account_id=account_id, roles=frozenset(role_codes), permissions=frozenset(permission_codes))
+    # The standalone device demo has no app_user table; the MySQL project does.
+    user_id = None
+    if db.get_bind().dialect.name == "mysql":
+        user_id = db.execute(text("SELECT user_id FROM app_user WHERE account_id=:id"),
+                             {"id": account_id}).scalar_one_or_none()
+    return Actor(account_id=account_id, user_id=user_id,
+                 roles=frozenset(role_codes), permissions=frozenset(permission_codes))
 
 
 def login_with_password(db, username: str, password: str):

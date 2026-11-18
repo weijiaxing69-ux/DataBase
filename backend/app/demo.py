@@ -38,7 +38,7 @@ def build_demo_app(factory) -> FastAPI:
     app = FastAPI(title="设备功能内存联调演示", version="1.0")
     install_error_handlers(app)
     app.include_router(assets_router, prefix="/api/v1/assets", tags=["场站与设备"])
-    app.include_router(auth_router, prefix="/api/v1/auth", tags=["登录认证"])
+    app.include_router(auth_router, prefix="/api/v1", tags=["登录认证与会员"])
 
     def demo_db():
         with factory() as db:

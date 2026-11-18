@@ -47,6 +47,28 @@ class DeviceCredentialIssue:
     expires_at: datetime
 
 
+@dataclass(frozen=True)
+class FleetAuthorizationSnapshot:
+    authorization_id: int
+    fleet_id: int
+    user_id: int
+    vehicle_id: int
+    card_id: int
+    valid_from: str
+    valid_until: str
+
+
+@dataclass(frozen=True)
+class FleetQuotaSnapshot:
+    authorization_id: int
+    order_id: int
+    bill_month: str
+    limit_amount: str
+    reserved_amount: str
+    used_amount: str
+    remaining_amount: str
+
+
 class PageResult(BaseModel, Generic[T]):
     # 当前页的数据列表
     items: list[T]

@@ -5,10 +5,37 @@ from sqlalchemy.exc import IntegrityError
 
 
 class BusinessError(ValueError):
-    def __init__(self, message: str, *, status_code: int = 400, code: str = "business_error"):
+    def __init__(self, message: str | int, *args, status_code: int = 400, code: str = "business_error"):
+        # Accept the existing shared signature and membership's (status, code, message) form.
+        if isinstance(message, int):
+            if len(args) != 2:
+                raise TypeError("BusinessError(status, code, message) requires three positional arguments")
+            status_code, code, message = message, str(args[0]), str(args[1])
+        elif args:
+            raise TypeError("BusinessError(message) accepts status_code and code as keywords")
         super().__init__(message)
         self.status_code = status_code
         self.code = code
+
+
+def bad_request(code: str, message: str) -> BusinessError:
+    return BusinessError(message, status_code=400, code=code)
+
+
+def unauthorized(code: str = "unauthorized", message: str = "认证失败") -> BusinessError:
+    return BusinessError(message, status_code=401, code=code)
+
+
+def forbidden(code: str = "forbidden", message: str = "无权执行此操作") -> BusinessError:
+    return BusinessError(message, status_code=403, code=code)
+
+
+def not_found(code: str = "not_found", message: str = "记录不存在") -> BusinessError:
+    return BusinessError(message, status_code=404, code=code)
+
+
+def conflict(code: str, message: str) -> BusinessError:
+    return BusinessError(message, status_code=409, code=code)
 
 
 def install_error_handlers(app: FastAPI) -> None:

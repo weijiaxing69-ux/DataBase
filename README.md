@@ -1,6 +1,6 @@
 # 新能源汽车充电平台
 
-按 V1.4 开发的充电平台。成员1设备后端、设备管理前端及必要的登录鉴权已实现；其他成员的订单、采样与设备回执提供独立模拟联调入口，完整计费支付等模块仍需对应成员实现。
+按 V1.4 开发的充电平台。成员1设备后端、设备管理前端及必要的登录鉴权已实现；成员4用户会员模块已接入主后端并提供独立前端。其他成员的订单、采样与设备回执提供独立模拟联调入口，完整计费支付等模块仍需对应成员实现。
 
 ## 运行设备管理页面
 
@@ -47,12 +47,17 @@ backend/.env 是本机连接配置，已加入 .gitignore，不提交给团队�
 - backend/app/core：配置、连接和安全公共代码。
 - backend/app/shared：跨模块契约。
 - backend/app/modules/assets：成员1的模型、Schema、DAO、Service、路由。
-- 其余四个模块目录预留给其他成员。
+- backend/app/modules/membership：成员4的用户、会员、优惠券、车队、钱包和评价模块。
 - backend/tests：设备业务、鉴权、HTTP及跨模块集成测试。
 - frontend/src：Vue页面、字段配置、样式与 API；frontend/tests：浏览器流程测试。
+- frontend/member4：成员4的独立 Vue 页面，提供 V1.4 membership 的 14 个路由。
 - database/bootstrap：原始建表、数据和验收脚本。
 - database/modules：各模块 SQL；migrations：升级脚本。
 - docs：统一 V1.4 JSON 契约副本。
+
+## 成员4会员模块
+
+会员后端路由已由主应用挂载在 `/api/v1` 下。先按 [会员数据库说明](database/modules/membership/README.md) 在统一项目数据库中加载会员权限、视图、过程和触发器，并配置 `backend/.env`；然后在 `backend` 目录启动 `../.venv/Scripts/python.exe -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000`。会员前端可在 `frontend/member4` 中运行 `npm install` 和 `npm run dev`；Vite 会将 `/api/v1` 请求代理到本机 `http://127.0.0.1:8000`。实现规划、逻辑设计和阶段记录见 [docs/member4](docs/member4/成员4_用户会员模块实现规划.md)。
 
 ## 模块接入
 

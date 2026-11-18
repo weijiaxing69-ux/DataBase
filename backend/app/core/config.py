@@ -14,6 +14,20 @@ class Settings(BaseSettings):
     # JWT 签名密钥；演示入口会在独立进程内生成，正式环境通过 .env 配置。
     auth_signing_key: str = ""
     auth_token_seconds: int = 3600
+    # Membership module settings; signing remains owned by the shared auth layer above.
+    app_env: str = "development"
+    plate_encryption_key: str = ""
+    phone_hmac_key: str = ""
+    plate_hmac_key: str = ""
+    fleet_reserve_amount: str = "50.00"
+
+    @property
+    def phone_fernet_key(self) -> str:
+        return self.phone_encryption_key
+
+    @property
+    def plate_fernet_key(self) -> str:
+        return self.plate_encryption_key or self.phone_encryption_key
 
     model_config = SettingsConfigDict(env_file=BACKEND_DIR / ".env", env_file_encoding="utf-8")
 
