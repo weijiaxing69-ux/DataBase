@@ -178,6 +178,21 @@ class TopupRequest(APIModel):
     amount: Decimal = Field(gt=0, max_digits=14, decimal_places=2)
 
 
+class WalletBalanceRefundRequest(APIModel):
+    amount: Decimal = Field(gt=0, max_digits=14, decimal_places=2)
+    reason: str = Field(min_length=3, max_length=500)
+    request_key: str = Field(min_length=12, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+
+
+class ReviewWalletBalanceRefundRequest(APIModel):
+    decision: str = Field(pattern="^(processing|approved|rejected)$")
+    note: str | None = Field(default=None, max_length=500)
+
+
+class WalletBalanceRefundQuery(PageQuery):
+    status: str | None = Field(default=None, pattern="^(pending_review|processing|completed|rejected)$")
+
+
 class FeedbackQuery(PageQuery):
     order_id: int | None = None
 
@@ -186,6 +201,24 @@ class CreateFeedbackRequest(APIModel):
     order_id: int
     rating: int = Field(ge=1, le=5)
     content: str | None = Field(default=None, max_length=1000)
+
+
+class AppealQuery(PageQuery):
+    status: str | None = Field(default=None, pattern="^(submitted|processing|resolved|rejected)$")
+    category: str | None = Field(default=None, pattern="^(billing_dispute|charging_service|account_coupon|other)$")
+
+
+class CreateAppealRequest(APIModel):
+    category: str = Field(pattern="^(billing_dispute|charging_service|account_coupon|other)$")
+    order_id: int | None = Field(default=None, gt=0)
+    subject: str = Field(min_length=3, max_length=120)
+    description: str = Field(min_length=5, max_length=2000)
+    request_key: str = Field(min_length=12, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+
+
+class HandleAppealRequest(APIModel):
+    status: str = Field(pattern="^(processing|resolved|rejected)$")
+    message: str = Field(min_length=2, max_length=1000)
 
 
 class AccountQuery(PageQuery):

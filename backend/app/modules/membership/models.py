@@ -20,6 +20,8 @@ TABLE_NAMES = frozenset(
         "sys_account_role", "sys_role_permission", "sys_account_operator",
         "sys_account_station", "sys_account_fleet", "promotion_station", "sys_session",
         "wallet_transaction", "fleet_quota_adjustment", "service_feedback",
+        "wallet_balance_refund_request", "membership_service_appeal",
+        "membership_service_appeal_event",
     }
 )
 

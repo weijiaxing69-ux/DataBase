@@ -5,19 +5,28 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 
 from app.core.errors import BusinessError
-from app.core.security import (
+from app.core.pii import (
     decrypt_text,
     encrypt_text,
-    hash_password,
     keyed_digest,
     mask_phone,
     mask_plate,
     normalize_phone,
     normalize_plate,
+)
+from app.core.security import (
+    hash_password,
     verify_password,
 )
 from app.modules.membership.dao import to_utc_naive
-from app.modules.membership.schemas import RegisterUserRequest, TopupRequest
+from app.modules.membership.schemas import (
+    CreateAppealRequest,
+    RegisterUserRequest,
+    ReviewWalletBalanceRefundRequest,
+    TopupRequest,
+    WalletBalanceRefundQuery,
+    WalletBalanceRefundRequest,
+)
 from app.modules.membership.service import _safe_phone, _safe_plate
 from cryptography.fernet import Fernet
 from decimal import Decimal
@@ -62,6 +71,24 @@ def test_request_schemas_enforce_server_side_input_bounds():
     with pytest.raises(ValueError):
         TopupRequest(amount=Decimal("0"))
     assert TopupRequest(amount=Decimal("10.25")).amount == Decimal("10.25")
+
+
+def test_wallet_refund_and_appeal_schemas_require_valid_idempotency_keys():
+    refund = WalletBalanceRefundRequest(
+        amount=Decimal("12.50"), reason="停止使用平台服务", request_key="refund_12345678",
+    )
+    assert refund.amount == Decimal("12.50")
+    assert ReviewWalletBalanceRefundRequest(decision="processing", note="正在核对退款信息").decision == "processing"
+    assert WalletBalanceRefundQuery(status="processing").status == "processing"
+    with pytest.raises(ValueError):
+        ReviewWalletBalanceRefundRequest(decision="unknown")
+    appeal = CreateAppealRequest(
+        category="billing_dispute", order_id=None, subject="服务费有疑问",
+        description="我想核对这笔订单的服务费", request_key="appeal_12345678",
+    )
+    assert appeal.order_id is None
+    with pytest.raises(ValueError):
+        WalletBalanceRefundRequest(amount=Decimal("-1"), reason="退钱", request_key="short")
 
 
 def test_datetime_conversion_always_stores_utc_without_timezone_marker():

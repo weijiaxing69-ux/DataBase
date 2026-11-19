@@ -36,8 +36,10 @@ from app.modules.membership.schemas import (
     AccountStatusRequest,
     AssignRolesRequest,
     AssignScopesRequest,
+    AppealQuery,
     BindVehicleRequest,
     CreateAccountRequest,
+    CreateAppealRequest,
     CreateFeedbackRequest,
     CreateFleetAuthorizationRequest,
     CreateFleetCardRequest,
@@ -47,6 +49,7 @@ from app.modules.membership.schemas import (
     FleetAuthorizationQuery,
     FleetCardQuery,
     FleetQuery,
+    HandleAppealRequest,
     IssueCouponsRequest,
     LoginRequest,
     LoginResponse,
@@ -55,9 +58,12 @@ from app.modules.membership.schemas import (
     PromotionQuery,
     RegisterUserRequest,
     ReviewPromotionRequest,
+    ReviewWalletBalanceRefundRequest,
     RoleQuery,
     SetFleetQuotaRequest,
     TopupRequest,
+    WalletBalanceRefundQuery,
+    WalletBalanceRefundRequest,
     UpdateFleetAuthorizationRequest,
     UpdateFleetCardRequest,
     UpdateFleetRequest,
@@ -219,8 +225,12 @@ def logout(db: Session, *, actor: Actor, request, jti: str | None = None) -> Non
     with transaction(db):
         run(
             db,
-            "UPDATE sys_session SET revoked_at = UTC_TIMESTAMP(3) WHERE account_id = :account_id AND jti_hash = :jti_hash AND revoked_at IS NULL",
-            {"account_id": actor.account_id, "jti_hash": hashlib.sha256(jti.encode("ascii")).digest()},
+            "UPDATE sys_session SET revoked_at = :revoked_at WHERE account_id = :account_id AND jti_hash = :jti_hash AND revoked_at IS NULL",
+            {
+                "revoked_at": utc_now_naive(),
+                "account_id": actor.account_id,
+                "jti_hash": hashlib.sha256(jti.encode("ascii")).digest(),
+            },
         )
 
 
@@ -990,6 +1000,341 @@ def list_wallet_transactions(db: Session, *, actor: Actor, query: PageQuery) -> 
     )
 
 
+def create_wallet_balance_refund_request(
+    db: Session, *, actor: Actor, request: WalletBalanceRefundRequest
+) -> dict:
+    require_permission(actor, "membership.wallet.refund.request")
+    user_id = _user_id(actor)
+    with transaction(db):
+        user = one(db, "SELECT balance, status FROM app_user WHERE user_id=:user_id FOR UPDATE",
+                   {"user_id": user_id})
+        if user is None or user["status"] != "active":
+            raise not_found("user_not_found", "车主档案不存在或已停用")
+
+        existing = one(
+            db,
+            """SELECT * FROM wallet_balance_refund_request
+                WHERE user_id=:user_id AND request_key=:request_key FOR UPDATE""",
+            {"user_id": user_id, "request_key": request.request_key},
+        )
+        if existing is not None:
+            if Decimal(existing["amount"]) != request.amount or existing["reason"] != request.reason:
+                raise conflict("refund_request_key_reused", "申请编号已用于不同的退款申请")
+            return existing
+
+        reserved = one(
+            db,
+            """SELECT COALESCE(SUM(amount), 0) AS reserved_amount
+                 FROM wallet_balance_refund_request
+                WHERE user_id=:user_id AND status IN ('pending_review', 'processing')""",
+            {"user_id": user_id},
+        )
+        available = Decimal(user["balance"]) - Decimal(reserved["reserved_amount"] or 0)
+        if request.amount > available:
+            raise conflict("refund_amount_exceeds_available", "申请金额超过扣除待处理申请后的可退余额")
+
+        refund_request_id = inserted_id(run(
+            db,
+            """INSERT INTO wallet_balance_refund_request
+                (user_id, amount, reason, status, request_key)
+                VALUES (:user_id, :amount, :reason, 'pending_review', :request_key)""",
+            {"user_id": user_id, "amount": request.amount, "reason": request.reason,
+             "request_key": request.request_key},
+        ))
+        return one(db, "SELECT * FROM wallet_balance_refund_request WHERE refund_request_id=:id",
+                   {"id": refund_request_id})
+
+
+def list_wallet_balance_refund_requests(
+    db: Session, *, actor: Actor, query: WalletBalanceRefundQuery
+) -> dict:
+    if actor.user_id is not None and "vehicle_owner" in actor.roles:
+        require_permission(actor, "membership.wallet.read")
+        user_id = _user_id(actor)
+        filters, params = ["user_id=:user_id"], {"user_id": user_id}
+        user = one(db, "SELECT balance FROM app_user WHERE user_id=:user_id", {"user_id": user_id})
+        reserved = one(
+            db,
+            """SELECT COALESCE(SUM(amount), 0) AS reserved_amount
+                 FROM wallet_balance_refund_request
+                WHERE user_id=:user_id AND status IN ('pending_review', 'processing')""",
+            {"user_id": user_id},
+        )
+        balance = Decimal(user["balance"]) if user is not None else Decimal("0.00")
+        reserved_amount = Decimal(reserved["reserved_amount"] or 0)
+        available_balance = balance - reserved_amount
+    else:
+        require_permission(actor, "membership.wallet.refund.review")
+        filters, params = ["1=1"], {}
+        balance = reserved_amount = available_balance = None
+
+    if query.status:
+        filters.append("status=:status")
+        params["status"] = query.status
+    if query.keyword:
+        filters.append("reason LIKE :keyword")
+        params["keyword"] = f"%{query.keyword.strip()}%"
+    if query.start_at:
+        filters.append("created_at >= :start_at")
+        params["start_at"] = to_utc_naive(query.start_at)
+    if query.end_at:
+        filters.append("created_at < :end_at")
+        params["end_at"] = to_utc_naive(query.end_at)
+    where = " AND ".join(filters)
+    result = page_result(
+        db,
+        count_sql=f"SELECT COUNT(*) AS total FROM wallet_balance_refund_request WHERE {where}",
+        rows_sql=f"""SELECT refund_request_id, user_id, amount, reason, status,
+                            reviewed_by_account_id, review_note, created_at, updated_at,
+                            reviewed_at, completed_at
+                       FROM wallet_balance_refund_request WHERE {where}
+                      ORDER BY created_at DESC, refund_request_id DESC LIMIT :limit OFFSET :offset""",
+        params=params, page=query.page, page_size=query.page_size,
+    )
+    if balance is not None:
+        result.update({"balance": balance, "reserved_amount": reserved_amount,
+                       "available_balance": available_balance})
+    return result
+
+
+def review_wallet_balance_refund_request(
+    db: Session, *, actor: Actor, refund_request_id: int,
+    request: ReviewWalletBalanceRefundRequest,
+) -> dict:
+    require_permission(actor, "membership.wallet.refund.review")
+    if request.decision in {"processing", "rejected"} and not (request.note or "").strip():
+        error_code = "refund_processing_note_required" if request.decision == "processing" else "refund_rejection_note_required"
+        message = "受理退款申请时必须填写处理说明" if request.decision == "processing" else "驳回申请时必须填写原因"
+        raise BusinessError(422, error_code, message)
+    if request.decision == "approved" and settings.app_env != "development":
+        raise forbidden("mock_refund_disabled", "模拟余额退款只允许在开发环境处理")
+
+    with transaction(db):
+        refund_request = one(
+            db,
+            "SELECT * FROM wallet_balance_refund_request WHERE refund_request_id=:id FOR UPDATE",
+            {"id": refund_request_id},
+        )
+        if refund_request is None:
+            raise not_found("refund_request_not_found", "余额退款申请不存在")
+        if refund_request["status"] == "completed" and request.decision == "approved":
+            return refund_request
+        if refund_request["status"] == "rejected" and request.decision == "rejected":
+            return refund_request
+        if refund_request["status"] == "processing" and request.decision == "processing":
+            return refund_request
+        if refund_request["status"] not in {"pending_review", "processing"}:
+            raise conflict("refund_request_already_reviewed", "该退款申请已经处理，不能重复变更")
+
+        now = utc_now_naive()
+        if request.decision == "processing":
+            run(
+                db,
+                """UPDATE wallet_balance_refund_request
+                      SET status='processing', reviewed_by_account_id=:reviewer,
+                          review_note=:note, reviewed_at=:now
+                    WHERE refund_request_id=:id""",
+                {"reviewer": actor.account_id, "note": request.note.strip(), "now": now,
+                 "id": refund_request_id},
+            )
+            return one(db, "SELECT * FROM wallet_balance_refund_request WHERE refund_request_id=:id",
+                       {"id": refund_request_id})
+
+        if request.decision == "rejected":
+            run(
+                db,
+                """UPDATE wallet_balance_refund_request
+                      SET status='rejected', reviewed_by_account_id=:reviewer,
+                          review_note=:note, reviewed_at=:now
+                    WHERE refund_request_id=:id""",
+                {"reviewer": actor.account_id, "note": request.note.strip(), "now": now,
+                 "id": refund_request_id},
+            )
+            return one(db, "SELECT * FROM wallet_balance_refund_request WHERE refund_request_id=:id",
+                       {"id": refund_request_id})
+
+        user_id = int(refund_request["user_id"])
+        amount = Decimal(refund_request["amount"])
+        user = one(db, "SELECT balance FROM app_user WHERE user_id=:user_id FOR UPDATE",
+                   {"user_id": user_id})
+        if user is None:
+            raise not_found("user_not_found", "车主档案不存在")
+        balance = Decimal(user["balance"])
+        other_reserved = one(
+            db,
+            """SELECT COALESCE(SUM(amount), 0) AS reserved_amount
+                 FROM wallet_balance_refund_request
+                WHERE user_id=:user_id AND status IN ('pending_review', 'processing') AND refund_request_id<>:id""",
+            {"user_id": user_id, "id": refund_request_id},
+        )
+        if balance - amount < Decimal(other_reserved["reserved_amount"] or 0):
+            raise conflict("refund_balance_reserved", "当前余额不足以处理此申请并保留其他待处理金额")
+
+        business_key = f"wallet_balance_refund_request:{refund_request_id}"
+        ledger = one(db, "SELECT * FROM wallet_transaction WHERE business_key=:key FOR UPDATE",
+                     {"key": business_key})
+        new_balance = balance
+        if ledger is None:
+            new_balance = balance - amount
+            run(db, "UPDATE app_user SET balance=:balance WHERE user_id=:user_id",
+                {"balance": new_balance, "user_id": user_id})
+            run(
+                db,
+                """INSERT INTO wallet_transaction
+                    (user_id, transaction_type, amount, balance_after, business_key, occurred_at)
+                   VALUES (:user_id, 'refund', :amount, :balance_after, :business_key, :occurred_at)""",
+                {"user_id": user_id, "amount": -amount, "balance_after": new_balance,
+                 "business_key": business_key, "occurred_at": now},
+            )
+        elif int(ledger["user_id"]) != user_id or Decimal(ledger["amount"]) != -amount:
+            raise conflict("refund_ledger_conflict", "已有退款流水与申请金额不一致")
+
+        run(
+            db,
+            """UPDATE wallet_balance_refund_request
+                  SET status='completed', reviewed_by_account_id=:reviewer,
+                      review_note=:note, reviewed_at=:now, completed_at=:now
+                WHERE refund_request_id=:id""",
+            {"reviewer": actor.account_id, "note": request.note, "now": now,
+             "id": refund_request_id},
+        )
+        return one(db, "SELECT * FROM wallet_balance_refund_request WHERE refund_request_id=:id",
+                   {"id": refund_request_id})
+
+
+def create_appeal(db: Session, *, actor: Actor, request: CreateAppealRequest) -> dict:
+    require_permission(actor, "membership.appeal.create")
+    user_id = _user_id(actor)
+    with transaction(db):
+        if request.order_id is not None:
+            order = one(db, "SELECT order_id, user_id FROM charging_order WHERE order_id=:id FOR UPDATE",
+                        {"id": request.order_id})
+            if order is None or int(order["user_id"]) != user_id:
+                raise not_found("appeal_order_not_found", "关联订单不存在或不属于当前账号")
+
+        existing = one(
+            db,
+            "SELECT * FROM membership_service_appeal WHERE user_id=:user_id AND request_key=:key FOR UPDATE",
+            {"user_id": user_id, "key": request.request_key},
+        )
+        if existing is not None:
+            same_payload = (
+                existing["category"] == request.category
+                and existing["order_id"] == request.order_id
+                and existing["subject"] == request.subject
+                and existing["description"] == request.description
+            )
+            if not same_payload:
+                raise conflict("appeal_request_key_reused", "提交编号已用于不同的申诉")
+            return existing
+
+        appeal_id = inserted_id(run(
+            db,
+            """INSERT INTO membership_service_appeal
+                (user_id, order_id, category, subject, description, status, request_key)
+                VALUES (:user_id, :order_id, :category, :subject, :description, 'submitted', :request_key)""",
+            {"user_id": user_id, "order_id": request.order_id, "category": request.category,
+             "subject": request.subject, "description": request.description,
+             "request_key": request.request_key},
+        ))
+        run(
+            db,
+            """INSERT INTO membership_service_appeal_event
+                (appeal_id, actor_account_id, from_status, to_status, message)
+                VALUES (:appeal_id, :actor, NULL, 'submitted', '会员提交申诉')""",
+            {"appeal_id": appeal_id, "actor": actor.account_id},
+        )
+        return one(db, "SELECT * FROM membership_service_appeal WHERE appeal_id=:id", {"id": appeal_id})
+
+
+def list_appeals(db: Session, *, actor: Actor, query: AppealQuery) -> dict:
+    if actor.user_id is not None and "vehicle_owner" in actor.roles:
+        require_permission(actor, "membership.appeal.read")
+        filters, params = ["user_id=:user_id"], {"user_id": actor.user_id}
+    else:
+        require_permission(actor, "membership.appeal.read")
+        filters, params = ["1=1"], {}
+    if query.status:
+        filters.append("status=:status")
+        params["status"] = query.status
+    if query.category:
+        filters.append("category=:category")
+        params["category"] = query.category
+    if query.keyword:
+        filters.append("(subject LIKE :keyword OR description LIKE :keyword)")
+        params["keyword"] = f"%{query.keyword.strip()}%"
+    if query.start_at:
+        filters.append("created_at >= :start_at")
+        params["start_at"] = to_utc_naive(query.start_at)
+    if query.end_at:
+        filters.append("created_at < :end_at")
+        params["end_at"] = to_utc_naive(query.end_at)
+    where = " AND ".join(filters)
+    return page_result(
+        db,
+        count_sql=f"SELECT COUNT(*) AS total FROM membership_service_appeal WHERE {where}",
+        rows_sql=f"""SELECT appeal_id, user_id, order_id, category, subject, description,
+                            status, assigned_account_id, last_response, created_at,
+                            updated_at, last_response_at
+                       FROM membership_service_appeal WHERE {where}
+                      ORDER BY created_at DESC, appeal_id DESC LIMIT :limit OFFSET :offset""",
+        params=params, page=query.page, page_size=query.page_size,
+    )
+
+
+def get_appeal(db: Session, *, actor: Actor, appeal_id: int) -> dict:
+    appeal = one(db, "SELECT * FROM membership_service_appeal WHERE appeal_id=:id", {"id": appeal_id})
+    if appeal is None:
+        raise not_found("appeal_not_found", "服务申诉不存在")
+    if actor.user_id is not None and "vehicle_owner" in actor.roles:
+        if int(appeal["user_id"]) != actor.user_id:
+            raise forbidden("appeal_out_of_scope", "不能查看其他会员的申诉")
+        require_permission(actor, "membership.appeal.read")
+    else:
+        require_permission(actor, "membership.appeal.read")
+    events = many(
+        db,
+        """SELECT appeal_event_id, actor_account_id, from_status, to_status, message, created_at
+             FROM membership_service_appeal_event WHERE appeal_id=:id ORDER BY appeal_event_id""",
+        {"id": appeal_id},
+    )
+    return {"appeal": appeal, "events": events}
+
+
+def handle_appeal(db: Session, *, actor: Actor, appeal_id: int,
+                  request: HandleAppealRequest) -> dict:
+    require_permission(actor, "membership.appeal.manage")
+    with transaction(db):
+        appeal = one(db, "SELECT * FROM membership_service_appeal WHERE appeal_id=:id FOR UPDATE",
+                     {"id": appeal_id})
+        if appeal is None:
+            raise not_found("appeal_not_found", "服务申诉不存在")
+        if appeal["status"] == request.status and appeal["last_response"] == request.message:
+            return get_appeal(db, actor=actor, appeal_id=appeal_id)
+        if appeal["status"] in {"resolved", "rejected"}:
+            raise conflict("appeal_already_closed", "已结案申诉不能再次修改")
+        old_status = appeal["status"]
+        now = utc_now_naive()
+        run(
+            db,
+            """UPDATE membership_service_appeal
+                  SET status=:status, assigned_account_id=:assignee,
+                      last_response=:message, last_response_at=:now
+                WHERE appeal_id=:id""",
+            {"status": request.status, "assignee": actor.account_id,
+             "message": request.message, "now": now, "id": appeal_id},
+        )
+        run(
+            db,
+            """INSERT INTO membership_service_appeal_event
+                (appeal_id, actor_account_id, from_status, to_status, message)
+                VALUES (:appeal_id, :actor, :from_status, :to_status, :message)""",
+            {"appeal_id": appeal_id, "actor": actor.account_id, "from_status": old_status,
+             "to_status": request.status, "message": request.message},
+        )
+        return get_appeal(db, actor=actor, appeal_id=appeal_id)
+
+
 def list_feedbacks(db: Session, *, actor: Actor, query: FeedbackQuery) -> dict:
     if actor.user_id is not None and "vehicle_owner" in actor.roles:
         require_permission(actor, "membership.feedback.read")
@@ -1668,8 +2013,16 @@ def debit_wallet_for_payment(db: Session, *, user_id: int, payment_id: int,
     if user is None or user["status"] != "active":
         raise not_found("user_not_found", "车主档案不存在或已停用")
     balance = Decimal(user["balance"])
-    if balance < amount:
-        raise conflict("wallet_insufficient", "余额不足")
+    refund_holds = one(
+        db,
+        """SELECT COALESCE(SUM(amount), 0) AS reserved_amount
+             FROM wallet_balance_refund_request
+            WHERE user_id=:user_id AND status IN ('pending_review', 'processing')""",
+        {"user_id": user_id},
+    )
+    available_balance = balance - Decimal(refund_holds["reserved_amount"] or 0)
+    if available_balance < amount:
+        raise conflict("wallet_insufficient", "扣除待处理退款申请后可用余额不足")
     new_balance = balance - amount
     run(db, "UPDATE app_user SET balance=:balance WHERE user_id=:id", {"balance": new_balance, "id": user_id})
     result = run(

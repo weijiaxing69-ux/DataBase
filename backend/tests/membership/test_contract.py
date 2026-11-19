@@ -17,7 +17,7 @@ from app.shared.contracts import Actor, FleetAuthorizationSnapshot
 from app.core.errors import BusinessError
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 CONTRACT_JSON = PROJECT_ROOT / "docs" / "新能源汽车充电桩运营服务平台_统一数据字典与接口函数规范_V1.4.json"
 MEMBERSHIP_SQL = PROJECT_ROOT / "database" / "modules" / "membership"
 
@@ -37,7 +37,17 @@ def test_membership_api_paths_match_v14_contract():
         if method.lower() in {"get", "post", "put", "patch", "delete"}
         and path.startswith(("/api/v1/auth/", "/api/v1/membership/"))
     }
-    assert expected == actual
+    extensions = {
+        ("post", "/api/v1/membership/wallet/refund-requests"),
+        ("get", "/api/v1/membership/wallet/refund-requests"),
+        ("post", "/api/v1/membership/wallet/refund-requests/{refund_request_id}/review"),
+        ("post", "/api/v1/membership/appeals"),
+        ("get", "/api/v1/membership/appeals"),
+        ("get", "/api/v1/membership/appeals/{appeal_id}"),
+        ("post", "/api/v1/membership/appeals/{appeal_id}/actions"),
+    }
+    assert expected <= actual
+    assert actual == expected | extensions
     assert len(expected) == 48
 
 
@@ -47,8 +57,10 @@ def test_frontend_routes_match_v14_page_list():
     source = (PROJECT_ROOT / "frontend" / "member4" / "src" / "router.js").read_text(encoding="utf-8")
     declared = re.findall(r"\{ path: '([^']+)', name:", source)
     actual = {path if path.startswith("/") else f"/{path}" for path in declared}
-    assert expected == actual
-    assert len(actual) == 14
+    extensions = {"/membership/wallet/refund-requests", "/membership/appeals"}
+    assert expected <= actual
+    assert actual == expected | extensions
+    assert len(actual) == 16
 
 
 def test_public_health_and_authenticated_route_response():
@@ -99,6 +111,16 @@ def test_membership_database_objects_are_present():
     assert len(re.findall(r"(?im)^create procedure ", procedure)) == 1
     assert len(re.findall(r"(?im)^create trigger ", triggers)) == 2
     assert len(re.findall(r"(?im)^-- (?:query|查询)\s*[123]", queries)) >= 3
+
+
+def test_member4_self_service_migration_contains_refund_and_appeal_ledgers():
+    migration = (PROJECT_ROOT / "database" / "migrations" / "20261119_member4_self_service.sql").read_text(encoding="utf-8")
+    assert "CREATE TABLE IF NOT EXISTS wallet_balance_refund_request" in migration
+    assert "UNIQUE KEY uq_wallet_balance_refund_user_key (user_id, request_key)" in migration
+    assert "status IN ('pending_review', 'processing', 'completed', 'rejected')" in migration
+    assert "CREATE TABLE IF NOT EXISTS membership_service_appeal" in migration
+    assert "CREATE TABLE IF NOT EXISTS membership_service_appeal_event" in migration
+    assert "FOREIGN KEY (order_id) REFERENCES charging_order (order_id)" in migration
 
 
 def test_wallet_and_coupon_helpers_do_not_commit_or_start_transactions():

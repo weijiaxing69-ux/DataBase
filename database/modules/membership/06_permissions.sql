@@ -28,8 +28,13 @@ INSERT INTO sys_permission (permission_code, permission_name) VALUES
 ('membership.fleet_quota.manage', '管理车队额度'),
 ('membership.wallet.read', '查看本人余额流水'),
 ('membership.wallet.topup', '开发环境模拟充值'),
+('membership.wallet.refund.request', '申请退还未使用余额'),
+('membership.wallet.refund.review', '审核余额退款申请'),
 ('membership.feedback.read', '查看评价'),
-('membership.feedback.create', '创建本人订单评价')
+('membership.feedback.create', '创建本人订单评价'),
+('membership.appeal.create', '提交本人服务申诉'),
+('membership.appeal.read', '查看服务申诉'),
+('membership.appeal.manage', '处理服务申诉')
 ON DUPLICATE KEY UPDATE permission_name = VALUES(permission_name);
 
 -- Platform administrators receive the full current permission registry.
@@ -46,7 +51,9 @@ FROM sys_role AS r JOIN sys_permission AS p ON p.permission_code IN (
     'membership.vehicle.read', 'membership.vehicle.manage',
     'membership.promotion.read', 'membership.coupon.read', 'membership.coupon.claim',
     'membership.wallet.read', 'membership.wallet.topup',
-    'membership.feedback.read', 'membership.feedback.create'
+    'membership.wallet.refund.request',
+    'membership.feedback.read', 'membership.feedback.create',
+    'membership.appeal.create', 'membership.appeal.read'
 )
 WHERE r.role_code = 'vehicle_owner';
 
@@ -56,7 +63,8 @@ SELECT r.role_id, p.permission_id
 FROM sys_role AS r JOIN sys_permission AS p ON p.permission_code IN (
     'membership.user.read', 'membership.user.verify', 'membership.vehicle.read',
     'membership.promotion.read', 'membership.coupon.read',
-    'membership.feedback.read'
+    'membership.feedback.read', 'membership.wallet.refund.review',
+    'membership.appeal.read', 'membership.appeal.manage'
 )
 WHERE r.role_code = 'customer_service';
 

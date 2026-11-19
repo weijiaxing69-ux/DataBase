@@ -113,6 +113,25 @@ tbody tr:last-child td { border-bottom: 0; }
 .loading-ring { width: 22px; height: 22px; border: 2px solid #e7eef9; border-top-color: var(--blue); border-radius: 50%; animation: spin .7s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .muted { color: #a3adba; }
+.refund-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 0 0 17px; }
+.refund-summary > div { display: grid; gap: 8px; padding: 15px 18px; background: #fff; border: 1px solid var(--line); border-radius: 11px; box-shadow: var(--shadow); }
+.refund-summary span { color: var(--muted); font-size: 10px; }
+.refund-summary strong { color: var(--ink); font-size: 18px; }
+.wrap-cell { white-space: normal; min-width: 150px; max-width: 300px; line-height: 1.6; }
+.status-pill { display: inline-flex; padding: 5px 8px; border-radius: 999px; background: #f0f3f7; color: #647184; font-size: 9px; }
+.status-pending_review, .status-submitted { color: #8c6217; background: #fff6df; }
+.status-processing { color: #2866b1; background: #eaf3ff; }
+.status-completed, .status-resolved { color: #207450; background: #e8f7ef; }
+.status-rejected { color: #a13b45; background: #fff0f1; }
+.appeal-detail { margin-top: 17px; }
+.appeal-description { color: #59667a; font-size: 11px; line-height: 1.8; white-space: pre-wrap; }
+.appeal-timeline { display: grid; gap: 0; margin: 18px 0 4px; }
+.appeal-event { display: grid; grid-template-columns: 18px 1fr; gap: 10px; padding-bottom: 18px; }
+.timeline-dot { width: 9px; height: 9px; margin: 3px 0 0 3px; border-radius: 50%; background: var(--blue); box-shadow: 0 0 0 4px #edf4ff; }
+.appeal-event strong { font-size: 10px; }
+.appeal-event p { margin: 5px 0; color: #59667a; font-size: 10px; line-height: 1.6; }
+.appeal-event small { color: #909cac; font-size: 9px; }
+.appeal-handler { border-top: 1px solid var(--line); padding-top: 16px; margin-top: 5px; }
 
 .auth-screen { min-height: 100vh; display: grid; grid-template-columns: minmax(360px, 1.02fr) minmax(430px, .98fr); background: #f8fafc; }
 .auth-visual { position: relative; overflow: hidden; min-height: 100vh; display: flex; align-items: center; padding: 9vw; color: white; background: linear-gradient(145deg, #132844, #1b3d67 52%, #24639a); }
@@ -173,6 +192,7 @@ tbody tr:last-child td { border-bottom: 0; }
   .data-toolbar { align-items: flex-start; gap: 10px; flex-direction: column; }
   .search-box, .search-box input { width: 100%; }
   .detail-grid { grid-template-columns: repeat(2, minmax(120px, 1fr)); padding: 14px; }
+  .refund-summary { grid-template-columns: 1fr; }
   .auth-screen { display: block; }
   .auth-visual { display: none; }
   .auth-panel { min-height: 100vh; padding: 30px 22px; }

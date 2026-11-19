@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 
-from fastapi import APIRouter, Depends, Path
+from fastapi import APIRouter, Depends, Path, Response
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 
@@ -15,8 +15,10 @@ from app.modules.membership.schemas import (
     AccountStatusRequest,
     AssignRolesRequest,
     AssignScopesRequest,
+    AppealQuery,
     BindVehicleRequest,
     CreateAccountRequest,
+    CreateAppealRequest,
     CreateFeedbackRequest,
     CreateFleetAuthorizationRequest,
     CreateFleetCardRequest,
@@ -28,15 +30,19 @@ from app.modules.membership.schemas import (
     FleetCardQuery,
     FleetQuery,
     IssueCouponsRequest,
+    HandleAppealRequest,
     LoginRequest,
     PageQuery,
     PermissionQuery,
     PromotionQuery,
     RegisterUserRequest,
     ReviewPromotionRequest,
+    ReviewWalletBalanceRefundRequest,
     RoleQuery,
     SetFleetQuotaRequest,
     TopupRequest,
+    WalletBalanceRefundQuery,
+    WalletBalanceRefundRequest,
     UpdateFleetAuthorizationRequest,
     UpdateFleetCardRequest,
     UpdateFleetRequest,
@@ -61,12 +67,12 @@ def get_current_user(db: Session = Depends(get_db), actor: Actor = Depends(get_c
     return service.get_current_user(db, actor=actor)
 
 
-@router.post("/auth/logout", tags=["auth"])
+@router.post("/auth/logout", tags=["auth"], status_code=204, response_class=Response)
 def logout(request: EmptyRequest, db: Session = Depends(get_db), actor: Actor = Depends(get_current_actor),
            credentials: HTTPAuthorizationCredentials = Depends(_bearer)):
     claims = security._claims(credentials.credentials)
     service.logout(db, actor=actor, request=request, jti=claims["jti"])
-    return {"success": True}
+    return Response(status_code=204)
 
 
 @router.post("/membership/users", tags=["membership"])
@@ -239,6 +245,41 @@ def mock_topup_wallet(request: TopupRequest, db: Session = Depends(get_db), acto
 @router.get("/membership/wallet/transactions", tags=["membership"])
 def list_wallet_transactions(query: PageQuery = Depends(), db: Session = Depends(get_db), actor: Actor = Depends(get_current_actor)):
     return service.list_wallet_transactions(db, actor=actor, query=query)
+
+
+@router.post("/membership/wallet/refund-requests", tags=["membership"])
+def create_wallet_balance_refund_request(request: WalletBalanceRefundRequest, db: Session = Depends(get_db), actor: Actor = Depends(get_current_actor)):
+    return service.create_wallet_balance_refund_request(db, actor=actor, request=request)
+
+
+@router.get("/membership/wallet/refund-requests", tags=["membership"])
+def list_wallet_balance_refund_requests(query: WalletBalanceRefundQuery = Depends(), db: Session = Depends(get_db), actor: Actor = Depends(get_current_actor)):
+    return service.list_wallet_balance_refund_requests(db, actor=actor, query=query)
+
+
+@router.post("/membership/wallet/refund-requests/{refund_request_id}/review", tags=["membership"])
+def review_wallet_balance_refund_request(refund_request_id: int, request: ReviewWalletBalanceRefundRequest, db: Session = Depends(get_db), actor: Actor = Depends(get_current_actor)):
+    return service.review_wallet_balance_refund_request(db, actor=actor, refund_request_id=refund_request_id, request=request)
+
+
+@router.post("/membership/appeals", tags=["membership"])
+def create_appeal(request: CreateAppealRequest, db: Session = Depends(get_db), actor: Actor = Depends(get_current_actor)):
+    return service.create_appeal(db, actor=actor, request=request)
+
+
+@router.get("/membership/appeals", tags=["membership"])
+def list_appeals(query: AppealQuery = Depends(), db: Session = Depends(get_db), actor: Actor = Depends(get_current_actor)):
+    return service.list_appeals(db, actor=actor, query=query)
+
+
+@router.get("/membership/appeals/{appeal_id}", tags=["membership"])
+def get_appeal(appeal_id: int, db: Session = Depends(get_db), actor: Actor = Depends(get_current_actor)):
+    return service.get_appeal(db, actor=actor, appeal_id=appeal_id)
+
+
+@router.post("/membership/appeals/{appeal_id}/actions", tags=["membership"])
+def handle_appeal(appeal_id: int, request: HandleAppealRequest, db: Session = Depends(get_db), actor: Actor = Depends(get_current_actor)):
+    return service.handle_appeal(db, actor=actor, appeal_id=appeal_id, request=request)
 
 
 @router.get("/membership/feedbacks", tags=["membership"])

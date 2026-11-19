@@ -3,6 +3,8 @@ import AppShell from './components/AppShell.vue'
 import LoginPage from './views/LoginPage.vue'
 import RegisterPage from './views/RegisterPage.vue'
 import ResourcePage from './views/ResourcePage.vue'
+import WalletRefundPage from './views/WalletRefundPage.vue'
+import AppealsPage from './views/AppealsPage.vue'
 
 const routes = [
   { path: '/login', name: 'login', component: LoginPage, meta: { public: true, title: '登录' } },
@@ -21,7 +23,9 @@ const routes = [
       { path: 'membership/fleet-cards', name: 'fleet-cards', component: ResourcePage, meta: { title: '车队卡', resource: 'fleet-cards' } },
       { path: 'membership/fleet-authorizations', name: 'fleet-authorizations', component: ResourcePage, meta: { title: '车辆授权与额度', resource: 'fleet-authorizations' } },
       { path: 'membership/wallet', name: 'wallet', component: ResourcePage, meta: { title: '钱包流水', resource: 'wallet' } },
+      { path: 'membership/wallet/refund-requests', name: 'wallet-refunds', component: WalletRefundPage, meta: { title: '余额退款申请' } },
       { path: 'membership/feedbacks', name: 'feedbacks', component: ResourcePage, meta: { title: '服务评价', resource: 'feedbacks' } },
+      { path: 'membership/appeals', name: 'appeals', component: AppealsPage, meta: { title: '服务申诉跟踪' } },
     ],
   },
 ]

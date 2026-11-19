@@ -50,7 +50,7 @@ backend/.env 是本机连接配置，已加入 .gitignore，不提交给团队�
 - backend/app/modules/membership：成员4的用户、会员、优惠券、车队、钱包和评价模块。
 - backend/tests：设备业务、鉴权、HTTP及跨模块集成测试。
 - frontend/src：Vue页面、字段配置、样式与 API；frontend/tests：浏览器流程测试。
-- frontend/member4：成员4的独立 Vue 页面，提供 V1.4 membership 的 14 个路由。
+- frontend/member4：成员4的独立 Vue 页面，提供 V1.4 membership 的 14 个路由及 2 个会员自助扩展页面。
 - database/bootstrap：原始建表、数据和验收脚本。
 - database/modules：各模块 SQL；migrations：升级脚本。
 - docs：统一 V1.4 JSON 契约副本。
