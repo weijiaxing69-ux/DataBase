@@ -1,0 +1,7 @@
+UTC: 2026-11-19T08:23:13.846185+00:00
+Python: 3.14.3
+Database: isolated MySQL; not the local application database.
+PASS: database/modules/settlement/test_settlement_sql.py; exit=0
+PASS: backend/tests/settlement/test_flow.py; exit=0
+PASS: backend/tests/settlement/test_v14_contract.py; exit=0
+PASS: backend/tests/settlement/test_concurrency.py; exit=0

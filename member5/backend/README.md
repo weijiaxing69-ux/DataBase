@@ -45,6 +45,14 @@ $env:FRONTEND_DIST = (Resolve-Path './frontend/dist').Path
 
 ## 联调约定
 
+结算持久层完整复验（包含并发与历史记录）：
+
+```powershell
+.\.venv\Scripts\python.exe -u .\backend\tests\settlement\run_acceptance.py
+```
+
+覆盖范围和结果日志位置见 `backend/tests/settlement/README.md`。
+
 - 本地登录使用 V1.4 账号和会话表，合并时换成成员四的公共登录与 Actor 依赖。当前平台管理员和客服拥有结算列表及开票入口，运营商按账号关联范围查看，并需确认权限才能代表运营商确认。
 - `app/modules/billing/queries.py` 与 `service.py` 中的车队收款分配是成员二接口的本地实现。合并时要联调成功退款写入、原账单抵扣回调、月结收款分配、额度和车队专价审批。专价在本模块仅创建草稿，启用归成员二的价格审批。
 - 账期按北京时间划分。归集正单保留原订单结束时刻，退款按成功时刻独立冲减；调整由另一名管理员审批，审批通过后升版并重新确认。
