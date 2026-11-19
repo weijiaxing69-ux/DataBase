@@ -1,0 +1,11 @@
+OK   incident                    23 / >= 20
+OK   incident_alert              25 / >= 20
+OK   incident_action             48 / >= 20
+OK   on_call_shift               23 / >= 20
+OK   escalation_policy           20 / >= 20
+OK   incident_escalation         23 / >= 20
+OK   postmortem                  21 / >= 20
+OK   action_item                 21 / >= 20
+OK   spare_part                  21 / >= 20
+OK   part_usage                  20 / >= 20
+OK   part_stock_movement         38 / >= 20

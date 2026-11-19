@@ -6,6 +6,7 @@ import {
   getOverview, listAlerts, listWorkOrders, listWorkOrderEvents,
   appendWorkOrderEvent, listIncidents, runTask, listSpareParts,
 } from '../../api/maintenance'
+import MaintenanceConsole from './MaintenanceConsole.vue'
 
 const overview = ref(null)
 const alerts = ref([])
@@ -23,15 +24,29 @@ const pageSize = 8
 const total = ref(0)
 const updatedAt = ref('')
 const taskName = ref('offline')
+const showConsole = ref(false)
 let timer = null
 let toastTimer = null
 
 const LEVEL = { critical: '严重', high: '高', medium: '中', low: '低' }
 const LEVEL_COLOR = { critical: '#b3452f', high: '#b9762a', medium: '#9a8124', low: '#6d7d74' }
 const ALERT_STATUS = { open: '未处理', processing: '处理中', recovering: '恢复观察', recovered: '已恢复' }
-const ALERT_CODE = { CHG01: '充电中断', TEMP01: '高温预警', MET01: '计量异常', E101: '绝缘故障' }
+const ALERT_CODE = { CHG01: '充电中断', TEMP01: '高温预警', MET01: '计量异常', CAP01: '场站功率过载', VLT01: '电压越限', E101: '绝缘故障' }
 const codeName = code => ALERT_CODE[code]
   || (/^SCN-TEMP/.test(code) ? '温度超限' : /^E\d/.test(code) ? '设备故障' : code)
+
+// 现场处置 SOP：按告警类型给出现场可执行动作，避免值班人员只看到码不知道下一步。
+const ALERT_SOP = {
+  CHG01: ['核实车辆 BMS 是否中断、订单是否仍在计费。', '检查枪头连接、枪锁与线缆是否松脱。', '必要时联系车主重新插枪，或按中断流程处理订单。'],
+  TEMP01: ['检查散热风扇、进出风口与环境温度。', '确认模块温度是否持续上升，必要时降功率或停机。', '温度回落后按恢复观察流程闭环。'],
+  MET01: ['先断电隔离，防止继电器粘连造成持续输出。', '检查电表读数、继电器与计量回路。', '修复后现场复核，再恢复服务。'],
+  CAP01: ['查看场站内正在充电的桩与功率分布。', '必要时限制部分桩功率或引导车主错峰充电。', '复核台区容量，确认未超出配电能力。'],
+  VLT01: ['检查电网电压是否波动、三相是否平衡。', '检查枪头接触、整流模块与接线端子。', '确认电压恢复后再恢复充电。'],
+  E101: ['立即核实绝缘检测与枪头接地。', '人员未撤离前不要继续充电。', '必要时停机并通知运维到场。'],
+}
+const DEFAULT_SOP = ['按告警等级与响应时限到场核实。', '先确认人员与设备安全，再排查故障现象。', '处置完成后按工单闭环流程复核。']
+const sopOf = alert => ALERT_SOP[alert?.alert_code]
+  || (/^SCN-TEMP/.test(alert?.alert_code || '') ? ['确认温度探头与环境温度。', '必要时降功率或停机散热。'] : DEFAULT_SOP)
 const WO_STATUS = { assigned: '待接单', accepted: '已接单', arrived: '已到场', repaired: '已修复', closed: '已闭环' }
 const INC_STATUS = { detected: '已发现', declared: '已宣布', contained: '已受控', restored: '已恢复', reviewed: '已复盘', closed: '已关闭', cancelled: '已取消' }
 const EVT = { accepted: '接单', arrived: '到场', repaired: '修复', review_passed: '复核通过', review_failed: '复核未通过', closed: '闭环', escalated: '超时升级' }
@@ -158,7 +173,11 @@ function actionsOf(order) {
   if (order.status === 'assigned') return [['accepted', '接单']]
   if (order.status === 'accepted') return [['arrived', '到场']]
   if (order.status === 'arrived') return [['repaired', '修复']]
-  if (order.status === 'repaired') return [['review_passed', '复核通过'], ['review_failed', '复核未通过'], ['closed', '闭环']]
+  if (order.status === 'repaired') {
+    const actions = [['review_passed', '复核通过'], ['review_failed', '复核未通过']]
+    if (order.review_passed) actions.push(['closed', '闭环'])
+    return actions
+  }
   return []
 }
 
@@ -194,7 +213,11 @@ async function triggerTask(name) {
     const label = { offline: '离线扫描', overdue: '超时升级', recovery: '恢复推进',
                     charging: '充电中断', safety: '安全停机', recurring: '复发升级',
                     inspection: '巡检到期', temperature: '高温预警',
-                    metering: '计量异常', occupied: '位占用检查' }[name] || name
+                    metering: '计量异常', occupied: '占用检查', overload: '场站过载',
+                    duration: '充电超时', voltage: '电压越限',
+                    gun_mismatch: '枪订单不一致',
+                    fault_state_mismatch: '故障标记未复位',
+                    sampling_gap: '采样断流' }[name] || name
     showToast(`${label}完成，影响 ${result.affected} 条`)
     await load()
   } catch (e) {
@@ -203,7 +226,11 @@ async function triggerTask(name) {
   } finally { busy.value = false }
 }
 
-function onKeydown(e) { if (e.key === 'Escape') closeDrawer() }
+function onKeydown(e) {
+  if (e.key !== 'Escape') return
+  if (showConsole.value) showConsole.value = false
+  else closeDrawer()
+}
 
 onMounted(() => {
   load()
@@ -226,16 +253,33 @@ onUnmounted(() => {
       </div>
       <div class="mt-actions">
         <span class="mt-live"><i></i>数据已连接</span>
+        <button class="mt-ghost" @click="showConsole = true">运维工作台</button>
         <select v-model="taskName" class="mt-select" aria-label="选择扫描任务">
-          <option value="offline">离线扫描</option>
-          <option value="overdue">超时升级</option>
-          <option value="recovery">恢复推进</option>
-          <option value="charging">充电中断</option>
-          <option value="safety">安全停机派单</option>
-          <option value="recurring">复发故障升级</option>
-          <option value="temperature">高温预警</option>
-          <option value="metering">计量异常</option>
-          <option value="occupied">充满占位</option>
+          <optgroup label="基础巡检">
+            <option value="offline">离线扫描</option>
+            <option value="overdue">超时升级</option>
+            <option value="recovery">恢复推进</option>
+            <option value="inspection">巡检到期</option>
+          </optgroup>
+          <optgroup label="现场识别">
+            <option value="charging">充电中断</option>
+            <option value="safety">安全停机派单</option>
+            <option value="recurring">复发故障升级</option>
+            <option value="temperature">高温预警</option>
+            <option value="metering">计量异常</option>
+            <option value="occupied">充满占位</option>
+            <option value="gun_mismatch">枪状态与订单不一致</option>
+          </optgroup>
+          <optgroup label="状态一致性">
+            <option value="gun_mismatch">枪状态与订单不一致</option>
+            <option value="fault_state_mismatch">故障标记未复位</option>
+            <option value="sampling_gap">充电订单采样断流</option>
+          </optgroup>
+          <optgroup label="用电与时长">
+            <option value="overload">场站功率过载</option>
+            <option value="duration">充电超时占位</option>
+            <option value="voltage">电压越限</option>
+          </optgroup>
         </select>
         <button class="mt-ghost" :disabled="busy" @click="triggerTask(taskName)">
           <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M3 8h10M9 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -442,6 +486,16 @@ onUnmounted(() => {
             <div><span>处置工单</span><b>{{ orders.length }}</b></div>
           </div>
 
+          <section class="mt-sop">
+            <header>
+              <strong>{{ codeName(selected.alert_code) }} · 现场处置提示</strong>
+              <span>按告警类型生成</span>
+            </header>
+            <ol>
+              <li v-for="(step, i) in sopOf(selected)" :key="i">{{ step }}</li>
+            </ol>
+          </section>
+
           <p v-if="!orders.length" class="mt-empty">该告警还没有派单</p>
           <article v-for="order in orders" :key="order.work_order_id" class="mt-order">
             <header>
@@ -478,6 +532,19 @@ onUnmounted(() => {
           </article>
         </div>
       </aside>
+    </transition>
+
+    <transition name="mt-fade">
+      <div v-if="showConsole" class="mt-console-mask" @click.self="showConsole = false"></div>
+    </transition>
+    <transition name="mt-console-slide">
+      <section v-if="showConsole" class="mt-console-panel" role="dialog" aria-modal="true" aria-label="运维工作台">
+        <header class="mt-console-head">
+          <div><p class="eyebrow">FULL OPERATIONS</p><h2>运维工作台</h2></div>
+          <button class="mt-close" aria-label="关闭" @click="showConsole = false">×</button>
+        </header>
+        <div class="mt-console-body"><MaintenanceConsole /></div>
+      </section>
     </transition>
 
     <transition name="mt-fade">
@@ -612,6 +679,13 @@ onUnmounted(() => {
 .mt-facts div { background: #f7faf8; border: 1px solid #e8ede9; border-radius: 8px; padding: 10px 12px; }
 .mt-facts span { display: block; font-size: 11px; color: #8b978f; margin-bottom: 4px; }
 .mt-facts b { font-size: 14px; color: #1d3b31; }
+
+.mt-sop { background: #f4f8f5; border: 1px solid #dbe9df; border-radius: 10px; padding: 12px 14px; margin-bottom: 16px; }
+.mt-sop header { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.mt-sop strong { font-size: 13px; color: #2c6a50; }
+.mt-sop header span { font-size: 11px; color: #8b978f; }
+.mt-sop ol { margin: 0; padding-left: 18px; display: grid; gap: 6px; }
+.mt-sop li { font-size: 12.5px; line-height: 1.55; color: #41544a; }
 .mt-order { border: 1px solid #e4ebe6; border-radius: 10px; padding: 13px 14px; margin-bottom: 12px; }
 .mt-order header { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 7px; }
 .mt-order header strong { font-size: 13px; }
@@ -628,9 +702,20 @@ onUnmounted(() => {
 .mt-timeline strong { font-size: 12.5px; margin-right: 7px; }
 .mt-timeline small { display: block; color: #8b978f; font-size: 11.5px; margin-top: 4px; }
 
-.mt-toast { position: fixed; left: 50%; bottom: 36px; transform: translateX(-50%);
+.mt-console-mask { position: fixed; inset: 0; background: rgba(18, 44, 34, .42); z-index: 44; }
+.mt-console-panel { position: fixed; inset: 4vh 3vw; max-width: 1180px; margin: 0 auto; background: #f7faf8;
+  border-radius: 12px; box-shadow: 0 24px 70px rgba(16, 42, 34, .28); z-index: 45;
+  display: flex; flex-direction: column; overflow: hidden; }
+.mt-console-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+  padding: 16px 22px; background: #fff; border-bottom: 1px solid #e2e9e4; }
+.mt-console-head h2 { margin: 2px 0 0; font-size: 18px; }
+.mt-console-body { padding: 18px 22px 24px; overflow-y: auto; }
+.mt-console-slide-enter-active, .mt-console-slide-leave-active { transition: opacity .18s, transform .18s; }
+.mt-console-slide-enter-from, .mt-console-slide-leave-to { opacity: 0; transform: translateY(12px); }
+
+.mt-toast { position: fixed; left: 50%; bottom: 36px; transform: translateX(-50%); z-index: 60;
   background: #123f32; color: #e7f3ea; font-size: 13px; padding: 11px 20px; border-radius: 8px;
-  z-index: 40; box-shadow: 0 10px 30px rgba(16, 42, 34, .28); }
+  box-shadow: 0 10px 30px rgba(16, 42, 34, .28); }
 .mt-toast.err { background: #7a2f24; color: #ffe9e4; }
 
 .mt-fade-enter-active, .mt-fade-leave-active { transition: opacity .18s; }

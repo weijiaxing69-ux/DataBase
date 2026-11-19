@@ -62,7 +62,7 @@ class InspectionQuery(PageQuery):
 class CreateAlarmRuleRequest(StrictModel):
     """新增告警规则。"""
 
-    rule_code: str = Field(max_length=50, description="规则码，全局唯一，例如 DEMO-E101")
+    rule_code: str = Field(min_length=1, max_length=50, description="规则码，全局唯一，例如 DEMO-E101")
     fault_code: Optional[str] = Field(default=None, max_length=32, description="匹配的设备故障码；温度/心跳规则留空")
     metric: str = Field(pattern="^(fault_code|temperature|heartbeat)$", description="判断指标：故障码 / 温度阈值 / 心跳秒数")
     threshold_value: Optional[Decimal] = Field(default=None, description="温度阈值（℃）或心跳超时秒数")
@@ -75,7 +75,7 @@ class CreateAlarmRuleRequest(StrictModel):
 class UpdateAlarmRuleRequest(StrictModel):
     """修改告警规则，只传需要改的字段。"""
 
-    fault_code: Optional[str] = Field(default=None, description="匹配的设备故障码")
+    fault_code: Optional[str] = Field(default=None, max_length=32, description="匹配的设备故障码")
     metric: Optional[str] = Field(default=None, pattern="^(fault_code|temperature|heartbeat)$", description="判断指标")
     threshold_value: Optional[Decimal] = Field(default=None, description="阈值")
     severity: Optional[str] = Field(default=None, pattern="^(low|medium|high|critical)$", description="告警等级")
@@ -89,7 +89,7 @@ class HeartbeatRequest(StrictModel):
 
     pile_id: int = Field(description="桩编号")
     reported_at: Optional[datetime] = Field(default=None, description="设备侧上报时间（UTC）；不传取服务器时间")
-    offline_seconds: int = Field(default=0, ge=0, description="设备自报的离线时长（秒）")
+    offline_seconds: int = Field(default=0, ge=0, le=2678400, description="设备自报的离线时长（秒），上限 31 天")
 
 
 class DeviceReadingRequest(StrictModel):
@@ -97,11 +97,11 @@ class DeviceReadingRequest(StrictModel):
 
     pile_id: int = Field(description="桩编号")
     sampled_at: datetime = Field(description="采样时刻（UTC）")
-    output_voltage_v: Decimal = Field(description="输出电压（V）")
-    output_current_a: Decimal = Field(description="输出电流（A）")
-    power_kw: Decimal = Field(description="输出功率（kW）")
-    module_temperature_c: Decimal = Field(description="模块温度（℃）")
-    offline_seconds: int = Field(default=0, ge=0, description="本次上报携带的离线时长（秒）")
+    output_voltage_v: Decimal = Field(ge=0, le=1500, description="输出电压（V）")
+    output_current_a: Decimal = Field(ge=0, le=2000, description="输出电流（A）")
+    power_kw: Decimal = Field(ge=0, le=2000, description="输出功率（kW）")
+    module_temperature_c: Decimal = Field(ge=-50, le=200, description="模块温度（℃）")
+    offline_seconds: int = Field(default=0, ge=0, le=2678400, description="本次上报携带的离线时长（秒），上限 31 天")
     fault_code: str = Field(default="NONE", max_length=32, description="故障码；正常为 NONE")
 
 
@@ -195,6 +195,7 @@ class WorkOrderDetail(StrictModel):
     result: Optional[str]
     accept_seconds: Optional[int] = None
     total_seconds: Optional[int] = None
+    review_passed: bool = False
 
 
 class WorkOrderEventDetail(StrictModel):
@@ -320,3 +321,34 @@ class PerformanceStats(StrictModel):
     operators: list[OperatorPerformance]
     stations: list[StationPerformance]
     generated_at: datetime
+
+
+class IncidentBoardItem(StrictModel):
+    incident_id: int
+    incident_no: str
+    title: str
+    severity: str
+    status: str
+    station_name: Optional[str]
+    detected_at: datetime
+    alert_count: int
+    open_work_orders: int
+    ack_seconds: Optional[int]
+    ack_breached: int
+    restore_seconds: Optional[int]
+    restore_breached: int
+    escalation_level: int
+
+
+class IncidentCreated(StrictModel):
+    incident_id: int
+
+
+class EscalationResult(StrictModel):
+    escalated: int
+
+
+class TaskRunResult(StrictModel):
+    task: str
+    affected: int
+    ran_at: datetime

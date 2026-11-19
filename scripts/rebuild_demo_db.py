@@ -2,7 +2,7 @@
 """一键重建演示库。
 
 按固定顺序执行 bootstrap 与各模块脚本，用于答辩前重置数据：
-    00 建表 → 04 种子 → 维护模块 02~05 → 迁移 16~20 →（可选）应急 10~12
+    00 建表 → 04 种子 → 维护模块 02~05 → 迁移 16/17/18/20 →（可选）应急 10/11/12/19/21/22
 
 用法：
     python scripts/rebuild_demo_db.py                # 交互确认后重建
@@ -36,13 +36,17 @@ MIGRATIONS = [
     "migrations/16_indexes.sql",
     "migrations/17_security_hardening.sql",
     "migrations/18_charging_anomaly_rule.sql",
-    "migrations/19_part_stock_movement.sql",
     "migrations/20_temperature_metering_rules.sql",
+    "migrations/23_station_overload_rule.sql",
+    "migrations/24_voltage_duration_rules.sql",
 ]
 EMERGENCY = [
     "migrations/10_emergency_tables.sql",
     "migrations/11_emergency_objects.sql",
     "migrations/12_emergency_seed.sql",
+    "migrations/19_part_stock_movement.sql",
+    "migrations/21_emergency_seed_extended.sql",
+    "migrations/22_emergency_extended_checks.sql",
 ]
 
 
@@ -57,7 +61,8 @@ def find_mysql(explicit: str | None) -> str:
     return "mysql"
 
 
-def run(mysql: str, args: dict, sql_file: Path | None = None, statement: str | None = None) -> None:
+def run(mysql: str, args: dict, sql_file: Path | None = None, statement: str | None = None,
+        use_db: bool = True) -> None:
     cmd = [mysql, f"--host={args['host']}", f"--port={args['port']}", f"--user={args['user']}",
            "--default-character-set=utf8mb4", "--protocol=TCP"]
     if args["password"] is not None:
@@ -66,7 +71,8 @@ def run(mysql: str, args: dict, sql_file: Path | None = None, statement: str | N
         cmd += ["-e", statement]
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
         return
-    cmd.append(args["db"])
+    if use_db:
+        cmd.append(args["db"])
     with open(sql_file, "rb") as handle:
         subprocess.run(cmd, stdin=handle, check=True)
 
@@ -114,7 +120,7 @@ def main() -> int:
                 print(f"  缺少脚本: {relative}", file=sys.stderr)
                 return 2
             print(f"  {index:>2}. {relative}")
-            run(mysql, args, sql_file=path)
+            run(mysql, args, sql_file=path, use_db=index > 1)
 
         print("[3/4] 校验对象数量 …")
         counts = {

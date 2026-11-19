@@ -10,9 +10,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -84,6 +86,8 @@ LIST_ENDPOINTS = [
     "/api/v1/maintenance/fault-reports?page_size=2",
     "/api/v1/maintenance/inspections?page_size=2",
     "/api/v1/maintenance/spare-parts?page_size=2",
+    "/api/v1/maintenance/part-usages?work_order_id=1",
+    "/api/v1/maintenance/part-movements?part_id=901",
     "/api/v1/maintenance/incidents",
     "/api/v1/maintenance/stats/overview",
     "/api/v1/maintenance/stats/performance",
@@ -126,7 +130,38 @@ def test_performance_serializes_datetime(client, auth):
     assert "generated_at" in body
 
 
+def test_incident_board_shape(client, auth):
+    body = client.get("/api/v1/maintenance/incidents", headers=auth).json()
+    assert isinstance(body, list)
+    if body:
+        assert {"incident_id", "title", "detected_at", "status"} <= set(body[0])
+
+
 def test_task_rejects_non_admin(client):
     engineer = {"Authorization": f"Bearer {_mint_token(102)}"}
     response = client.post("/api/v1/maintenance/tasks/offline/run", headers=engineer)
     assert response.status_code == 403
+
+
+def test_task_rejects_unknown_name(client, auth):
+    response = client.post("/api/v1/maintenance/tasks/not-a-task/run", headers=auth)
+    assert response.status_code == 422
+
+
+def test_frontend_api_covers_all_routes():
+    root = Path(__file__).resolve().parents[3]
+    text = (root / "frontend/src/api/maintenance.js").read_text(encoding="utf-8")
+    js_paths = {
+        re.sub(r"\$\{[^}]+\}", "{}", raw)
+        for raw in re.findall(r"['\"`](/maintenance/[^'\"`]+)['\"`]", text)
+    }
+    api_paths = {
+        re.sub(r"\{[^}]+\}", "{}", path.replace("/api/v1", ""))
+        for path in app.openapi()["paths"]
+        if path.startswith("/api/v1/maintenance")
+    }
+    assert api_paths <= js_paths, f"前端 API 缺少路径：{sorted(api_paths - js_paths)}"
+
+    console = (root / "frontend/src/views/maintenance/MaintenanceConsole.vue").read_text(encoding="utf-8")
+    detail_apis = ["getAlarmRule", "getAlert", "getWorkOrder", "getFaultReport", "getInspection"]
+    assert all(f"api.{name}" in console for name in detail_apis), "运维工作台缺少单条详情入口"

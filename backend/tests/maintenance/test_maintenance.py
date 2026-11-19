@@ -23,6 +23,7 @@ from sqlalchemy import text
 from app.core.database import SessionLocal, engine
 from app.core.errors import BusinessError
 from app.modules.assets.models import DeviceCredential
+from app.modules.maintenance import emergency
 from app.modules.maintenance import schemas as s
 from app.modules.maintenance import service
 from app.modules.maintenance.device import DeviceActor, authenticate_device
@@ -188,6 +189,22 @@ def test_alarm_rule_crud(db):
     finally:
         db.execute(text("delete from alarm_rule where rule_code = 'T-UNIT-001'"))
         db.commit()
+
+
+def test_rule_manage_cannot_use_assign_permission(db):
+    assigner = Actor(
+        account_id=102,
+        roles=frozenset({"maintenance_engineer"}),
+        permissions=frozenset({"maintenance.work_order.assign"}),
+    )
+    with pytest.raises(PermissionError):
+        service.create_alarm_rule(
+            db, actor=assigner,
+            request=s.CreateAlarmRuleRequest(
+                rule_code="T-NO-PERM", fault_code="TNP", metric="fault_code",
+                severity="low", response_seconds=600, recovery_seconds=60,
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -451,8 +468,11 @@ def test_close_requires_review_passed(db):
         for event_type, offset in [("accepted", 10), ("arrived", 20), ("repaired", 30)]:
             service.append_work_order_event(
                 db, actor=ENGINEER, work_order_id=wo.work_order_id,
-                request=s.WorkOrderEventRequest(event_type=event_type,
-                                                event_at=base + timedelta(seconds=offset)),
+                request=s.WorkOrderEventRequest(
+                    event_type=event_type,
+                    event_at=base + timedelta(seconds=offset),
+                    review_result="复测通过" if event_type == "review_passed" else None,
+                ),
             )
         with pytest.raises(BusinessError) as err:
             service.append_work_order_event(
@@ -465,12 +485,67 @@ def test_close_requires_review_passed(db):
         service.append_work_order_event(
             db, actor=ENGINEER, work_order_id=wo.work_order_id,
             request=s.WorkOrderEventRequest(event_type="review_passed",
-                                            event_at=base + timedelta(seconds=50)),
+                                            event_at=base + timedelta(seconds=50),
+                                            review_result="复测通过"),
         )
         detail = service.append_work_order_event(
             db, actor=ENGINEER, work_order_id=wo.work_order_id,
             request=s.WorkOrderEventRequest(event_type="closed",
                                             event_at=base + timedelta(seconds=60)),
+        )
+        assert detail.status == "closed"
+    finally:
+        _cleanup_alert_chain(db, [alert_id])
+        db.execute(text("delete from device_reading where pile_id = :p and sampled_at = :t"),
+                   {"p": pile_id, "t": sampled_at})
+        _drop_credential(db, device)
+        db.commit()
+
+
+def test_close_after_rework_needs_new_review(db):
+    pile_id = 14
+    alert_id, sampled_at, device = _make_alert(db, pile_id)
+    try:
+        wo = service.create_work_order(
+            db, actor=ADMIN, alert_id=alert_id,
+            request=s.CreateWorkOrderRequest(assigned_to=102),
+        )
+        base = wo.assigned_at
+        steps = [
+            ("accepted", 10, None), ("arrived", 20, None), ("repaired", 30, None),
+            ("review_passed", 40, "首轮复测通过"), ("review_failed", 50, "复测未通过"),
+            ("repaired", 60, None),
+        ]
+        for event_type, offset, review_result in steps:
+            detail = service.append_work_order_event(
+                db, actor=ENGINEER, work_order_id=wo.work_order_id,
+                request=s.WorkOrderEventRequest(
+                    event_type=event_type, event_at=base + timedelta(seconds=offset),
+                    review_result=review_result,
+                ),
+            )
+        assert detail.status == "repaired"
+        assert detail.review_passed is False
+
+        with pytest.raises(BusinessError) as err:
+            service.append_work_order_event(
+                db, actor=ENGINEER, work_order_id=wo.work_order_id,
+                request=s.WorkOrderEventRequest(event_type="closed",
+                                                event_at=base + timedelta(seconds=70)),
+            )
+        assert err.value.status_code == 409
+
+        service.append_work_order_event(
+            db, actor=ENGINEER, work_order_id=wo.work_order_id,
+            request=s.WorkOrderEventRequest(
+                event_type="review_passed", event_at=base + timedelta(seconds=80),
+                review_result="重修后复测通过",
+            ),
+        )
+        detail = service.append_work_order_event(
+            db, actor=ENGINEER, work_order_id=wo.work_order_id,
+            request=s.WorkOrderEventRequest(event_type="closed",
+                                            event_at=base + timedelta(seconds=90)),
         )
         assert detail.status == "closed"
     finally:
@@ -548,8 +623,11 @@ def test_recovery_task_promotes_alert(db):
                                    ("review_passed", 20)]:
             service.append_work_order_event(
                 db, actor=ENGINEER, work_order_id=wo.work_order_id,
-                request=s.WorkOrderEventRequest(event_type=event_type,
-                                                event_at=base + timedelta(seconds=offset)),
+                request=s.WorkOrderEventRequest(
+                    event_type=event_type,
+                    event_at=base + timedelta(seconds=offset),
+                    review_result="复测通过" if event_type == "review_passed" else None,
+                ),
             )
         service.append_work_order_event(
             db, actor=ENGINEER, work_order_id=wo.work_order_id,
@@ -616,6 +694,44 @@ def test_part_usage_deducts_stock(db):
                           {"p": part.part_id}).scalar_one() == 0
     finally:
         db.execute(text("delete from part_usage where part_id = :p"), {"p": part.part_id})
+        db.execute(text("delete from spare_part where part_id = :p"), {"p": part.part_id})
+        _cleanup_alert_chain(db, [alert_id])
+        db.execute(text("delete from device_reading where pile_id = :p and sampled_at = :t"),
+                   {"p": pile_id, "t": sampled_at})
+        _drop_credential(db, device)
+        db.commit()
+
+
+def test_inactive_part_cannot_be_used_or_stocked(db):
+    from app.modules.maintenance import models as m
+
+    pile_id = 6
+    alert_id, sampled_at, device = _make_alert(db, pile_id)
+    wo = service.create_work_order(
+        db, actor=ADMIN, alert_id=alert_id, request=s.CreateWorkOrderRequest(assigned_to=102)
+    )
+    db.execute(text("delete from spare_part where part_code = 'T-PART-OFF'"))
+    db.commit()
+    part = m.SparePart(part_code="T-PART-OFF", part_name="停用备件", unit="个",
+                       station_id=None, stock_qty=10, safety_stock=0, status="disabled")
+    db.add(part)
+    db.commit()
+    try:
+        with pytest.raises(BusinessError) as err:
+            service.create_part_usage(
+                db, actor=ADMIN,
+                request=s.CreatePartUsageRequest(work_order_id=wo.work_order_id,
+                                                 part_id=part.part_id, qty=1),
+            )
+        assert err.value.status_code == 409
+
+        with pytest.raises(BusinessError) as err:
+            service.stock_in_part(
+                db, actor=ADMIN,
+                request=s.StockInRequest(part_id=part.part_id, qty=1),
+            )
+        assert err.value.status_code == 409
+    finally:
         db.execute(text("delete from spare_part where part_id = :p"), {"p": part.part_id})
         _cleanup_alert_chain(db, [alert_id])
         db.execute(text("delete from device_reading where pile_id = :p and sampled_at = :t"),
@@ -743,6 +859,34 @@ def test_declare_incident_requires_operator_scope(db):
             db, actor=outsider, operator_id=1, station_id=None,
             category="power", severity="P2", title="越权声明测试",
         )
+
+
+def test_declare_incident_rejects_foreign_alert(db):
+    alert_id, sampled_at, device = _make_alert(db, 2)
+    try:
+        with pytest.raises(BusinessError) as err:
+            emergency.declare_incident(
+                db, actor=ADMIN, operator_id=1, station_id=1,
+                category="power", severity="P2", title="跨场站告警不能关联",
+                alert_id=alert_id,
+            )
+        assert err.value.status_code == 409
+    finally:
+        _cleanup_alert_chain(db, [alert_id])
+        db.execute(text("delete from device_reading where pile_id = :p and sampled_at = :t"),
+                   {"p": 2, "t": sampled_at})
+        _drop_credential(db, device)
+        db.commit()
+
+
+def test_declare_incident_rejects_missing_alert(db):
+    with pytest.raises(BusinessError) as err:
+        emergency.declare_incident(
+            db, actor=ADMIN, operator_id=1, station_id=1,
+            category="power", severity="P2", title="告警不存在",
+            alert_id=99999999,
+        )
+    assert err.value.status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -1083,6 +1227,182 @@ def test_occupied_without_order_notifies(db):
 
 
 # ---------------------------------------------------------------------------
+# 30b. 长时间充电占位：提醒场站联系车主
+# ---------------------------------------------------------------------------
+def test_long_charging_notifies(db):
+    now = utcnow()
+    db.execute(text("delete from notification where notification_type = 'long_charging'"))
+    db.execute(text("delete from charging_order where gun_id = 20 and status = 'charging'"))
+    db.execute(text(
+        """insert into charging_order
+             (user_id, gun_id, rule_id, operator_id, station_id, order_mode,
+              status, started_at)
+           values (1, 20, 1, 20, 20, 'personal', 'charging',
+                   utc_timestamp() - interval 5 hour)"""
+    ))
+    db.commit()
+    order_id = db.execute(text(
+        "select order_id from charging_order where gun_id = 20 and status = 'charging' "
+        "order by order_id desc limit 1"
+    )).scalar_one()
+    try:
+        assert service.check_long_charging(db, now=now, minutes=240) >= 1
+        assert db.execute(text(
+            "select count(*) from notification where notification_type = 'long_charging'"
+        )).scalar_one() >= 1
+        # 同一天同一订单只提醒一次
+        assert service.check_long_charging(db, now=now, minutes=240) == 0
+    finally:
+        db.execute(text("delete from notification where notification_type = 'long_charging'"))
+        db.execute(text("delete from charging_order where order_id = :o"), {"o": order_id})
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 30c. 电压越限：连续采样电压低于/高于阈值
+# ---------------------------------------------------------------------------
+def test_voltage_anomaly_creates_alert(db):
+    pile_id = 15
+    db.execute(text("delete from device_alert where alert_code = 'VLT01' and pile_id = :p"), {"p": pile_id})
+    db.commit()
+    now = ms_now()
+    try:
+        for offset in (30, 60):
+            db.execute(text(
+                """insert into device_reading
+                   (pile_id, sampled_at, output_voltage_v, output_current_a, power_kw,
+                    module_temperature_c, offline_seconds, fault_code)
+                   values (:p, :t, 250, 12, 3, 40, 0, 'NONE')"""
+            ), {"p": pile_id, "t": now - timedelta(seconds=offset)})
+        db.commit()
+
+        assert service.check_voltage_anomaly(db, now=now) >= 1
+        assert db.execute(text(
+            "select severity, status from device_alert where alert_code = 'VLT01' and pile_id = :p"
+        ), {"p": pile_id}).one()[0] == "high"
+        assert service.check_voltage_anomaly(db, now=now) == 0
+    finally:
+        _cleanup_alert_chain(db, [r[0] for r in db.execute(text(
+            "select alert_id from device_alert where alert_code = 'VLT01' and pile_id = :p"), {"p": pile_id})])
+        db.execute(text("delete from device_reading where pile_id = :p and sampled_at >= :t"),
+                   {"p": pile_id, "t": now - timedelta(minutes=10)})
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 30d. 枪状态与订单不一致：提前拔枪 / 枪锁卡住
+# ---------------------------------------------------------------------------
+def test_gun_order_mismatch_notifies(db):
+    now = utcnow()
+    db.execute(text("delete from notification where notification_type = 'gun_order_mismatch'"))
+    db.execute(text("delete from charging_order where gun_id = 20 and status = 'charging'"))
+    db.commit()
+    order_id = None
+    try:
+        # 1) 订单仍在充电，但枪状态不是占用：车主提前拔枪或枪锁未复位
+        db.execute(text(
+            """insert into charging_order
+                 (user_id, gun_id, rule_id, operator_id, station_id, order_mode,
+                  status, started_at)
+               values (1, 20, 1, 20, 20, 'personal', 'charging',
+                       utc_timestamp() - interval 10 minute)"""
+        ))
+        db.execute(text("update charging_gun set status = 'idle' where gun_id = 20"))
+        db.commit()
+        order_id = db.execute(text(
+            "select order_id from charging_order where gun_id = 20 and status = 'charging' "
+            "order by order_id desc limit 1"
+        )).scalar_one()
+
+        assert service.check_gun_order_mismatch(db, now=now, minutes=30) >= 1
+        assert db.execute(text(
+            "select count(*) from notification where notification_type = 'gun_order_mismatch'"
+        )).scalar_one() >= 1
+
+        # 2) 枪显示占用，但没有进行中订单：枪锁卡住或状态未归位
+        db.execute(text("delete from charging_order where gun_id = 20 and status = 'charging'"))
+        db.execute(text("update charging_gun set status = 'occupied' where gun_id = 20"))
+        db.commit()
+        assert service.check_gun_order_mismatch(db, now=now, minutes=30) == 1
+        assert db.execute(text(
+            "select count(*) from notification where notification_type = 'gun_order_mismatch'"
+        )).scalar_one() == 2
+    finally:
+        db.execute(text("delete from notification where notification_type = 'gun_order_mismatch'"))
+        db.execute(text("delete from charging_order where gun_id = 20 and status = 'charging'"))
+        db.execute(text("update charging_gun set status = 'idle' where gun_id = 20"))
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 30e. 故障标记未复位 / 充电订单采样断流
+# ---------------------------------------------------------------------------
+def test_fault_state_mismatch_notifies(db):
+    now = utcnow()
+    db.execute(text("delete from notification where notification_type = 'fault_state_mismatch'"))
+    originals = db.execute(text(
+        "select entity_id, entity_type, has_fault, status from ("
+        " select pile_id as entity_id, 'pile' as entity_type, has_fault, status"
+        " from charging_pile where pile_id = 20"
+        " union all"
+        " select gun_id, 'gun', has_fault, status"
+        " from charging_gun where gun_id = 20"
+        ") t"
+    )).all()
+    db.execute(text("update charging_pile set has_fault = 1, status = 'idle' where pile_id = 20"))
+    db.execute(text("update charging_gun set has_fault = 1, status = 'idle' where gun_id = 20"))
+    db.commit()
+    try:
+        assert service.check_fault_state_mismatch(db, now=now) >= 2
+        assert db.execute(text(
+            "select count(*) from notification where notification_type = 'fault_state_mismatch'"
+        )).scalar_one() >= 2
+        # 同一天同一设备只提醒一次
+        assert service.check_fault_state_mismatch(db, now=now) == 0
+    finally:
+        for entity_id, entity_type, has_fault, status in originals:
+            if entity_type == 'pile':
+                db.execute(text(
+                    "update charging_pile set has_fault = :f, status = :s where pile_id = :i"
+                ), {"f": has_fault, "s": status, "i": entity_id})
+            else:
+                db.execute(text(
+                    "update charging_gun set has_fault = :f, status = :s where gun_id = :i"
+                ), {"f": has_fault, "s": status, "i": entity_id})
+        db.execute(text("delete from notification where notification_type = 'fault_state_mismatch'"))
+        db.commit()
+
+
+def test_order_sampling_gap_notifies(db):
+    now = utcnow()
+    db.execute(text("delete from notification where notification_type = 'sampling_gap'"))
+    db.execute(text("delete from charging_order where gun_id = 20 and status = 'charging'"))
+    db.execute(text("delete from device_reading where pile_id = 20 and sampled_at >= :t"),
+               {"t": now - timedelta(minutes=10)})
+    db.execute(text("update charging_pile set is_online = 1 where pile_id = 20"))
+    db.commit()
+    db.execute(text(
+        """insert into charging_order
+             (user_id, gun_id, rule_id, operator_id, station_id, order_mode,
+              status, started_at)
+           values (1, 20, 1, 20, 20, 'personal', 'charging',
+                   utc_timestamp() - interval 15 minute)"""
+    ))
+    db.commit()
+    try:
+        assert service.check_order_sampling_gap(db, now=now, minutes=10) >= 1
+        assert db.execute(text(
+            "select count(*) from notification where notification_type = 'sampling_gap'"
+        )).scalar_one() >= 1
+        # 同一天同一订单只提醒一次
+        assert service.check_order_sampling_gap(db, now=now, minutes=10) == 0
+    finally:
+        db.execute(text("delete from notification where notification_type = 'sampling_gap'"))
+        db.execute(text("delete from charging_order where gun_id = 20 and status = 'charging'"))
+        db.commit()
+
+
+# ---------------------------------------------------------------------------
 # 31. 批量任务：单条失败不影响其他条目
 # ---------------------------------------------------------------------------
 def test_task_item_failure_does_not_abort_batch(db, monkeypatch):
@@ -1187,3 +1507,154 @@ def test_alert_list_has_overdue_flag(db):
     assert page.items
     for item in page.items:
         assert isinstance(item.is_overdue, bool)
+
+
+# ---------------------------------------------------------------------------
+# 36. 场站功率过载：多桩同时快充，按场站聚合并只建一条告警
+# ---------------------------------------------------------------------------
+def test_station_overload_creates_one_alert(db):
+    now = utcnow()
+    sampled_at = ms_now()
+    piles = [901, 902]
+    for pile in piles:
+        db.execute(
+            text(
+                "insert into device_reading "
+                "(pile_id, sampled_at, output_voltage_v, output_current_a, power_kw, "
+                " module_temperature_c, fault_code) "
+                "values (:p, :t, 400, 400, 180, 40, '')"
+            ),
+            {"p": pile, "t": sampled_at},
+        )
+    db.commit()
+
+    created = service.check_station_overload(
+        db, now=now + timedelta(seconds=1), window_minutes=10, threshold_kw=300
+    )
+    assert created == 1
+    again = service.check_station_overload(
+        db, now=now + timedelta(seconds=2), window_minutes=10, threshold_kw=300
+    )
+    assert again == 0
+
+    ids = [
+        r[0]
+        for r in db.execute(
+            text("select alert_id from device_alert where alert_code='CAP01'")
+        ).all()
+    ]
+    assert len(ids) >= 1
+    _cleanup_alert_chain(db, ids)
+    db.execute(
+        text("delete from device_reading where sampled_at = :t and pile_id in (901,902)"),
+        {"t": sampled_at},
+    )
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 37. 应急事件：全局升级与跨站关闭必须被拒
+# ---------------------------------------------------------------------------
+def test_escalate_requires_incident_permission(db):
+    engineer = Actor(
+        account_id=102, roles=frozenset({"maintenance_engineer"}),
+        permissions=frozenset({"maintenance.work_order.handle"}),
+    )
+    with pytest.raises(PermissionError):
+        emergency.escalate_incidents(db, actor=engineer)
+
+
+def test_incident_manage_cannot_use_assign_permission(db):
+    assigner = Actor(
+        account_id=102,
+        roles=frozenset({"maintenance_engineer"}),
+        permissions=frozenset({"maintenance.work_order.assign"}),
+    )
+    with pytest.raises(PermissionError):
+        emergency.declare_incident(
+            db, actor=assigner, operator_id=1, station_id=1,
+            category="power", severity="P2", title="派单权限不应能声明事件",
+        )
+    with pytest.raises(PermissionError):
+        emergency.close_incident(db, actor=assigner, incident_id=901, summary="派单权限不应能关闭事件")
+
+
+def test_close_incident_rejects_out_of_scope(db):
+    outsider = Actor(
+        account_id=999, roles=frozenset({"maintenance_engineer"}),
+        permissions=frozenset({"maintenance.incident.manage"}),
+    )
+    with pytest.raises(PermissionError):
+        emergency.close_incident(db, actor=outsider, incident_id=901, summary="越权关闭测试")
+
+
+def test_incident_board_respects_scope(db):
+    outsider = Actor(
+        account_id=999, roles=frozenset({"maintenance_engineer"}),
+        permissions=frozenset({"maintenance.alert.read"}),
+    )
+    assert emergency.list_incident_board(db, actor=outsider) == []
+    board = emergency.list_incident_board(db, actor=ADMIN)
+    assert len(board) > 0
+    assert {"incident_id", "title", "detected_at", "status"} <= set(board[0])
+
+
+# ---------------------------------------------------------------------------
+# 38. 设备上报：未来时间直接拒绝，不写库
+# ---------------------------------------------------------------------------
+def test_heartbeat_rejects_future_time(db):
+    pile_id = 16
+    token, device = _issue_credential(db, pile_id)
+    try:
+        with pytest.raises(BusinessError):
+            service.receive_heartbeat(
+                db, device=device,
+                request=s.HeartbeatRequest(pile_id=pile_id, reported_at=utcnow() + timedelta(days=1)),
+            )
+    finally:
+        _drop_credential(db, device)
+
+
+def test_reading_rejects_future_time(db):
+    pile_id = 17
+    token, device = _issue_credential(db, pile_id)
+    try:
+        with pytest.raises(BusinessError):
+            service.ingest_device_reading(
+                db, device=device,
+                request=s.DeviceReadingRequest(
+                    pile_id=pile_id, sampled_at=utcnow() + timedelta(days=1),
+                    output_voltage_v=400, output_current_a=10, power_kw=4,
+                    module_temperature_c=36,
+                ),
+            )
+    finally:
+        _drop_credential(db, device)
+
+
+# ---------------------------------------------------------------------------
+# 39. 报障完整性：枪号必须存在，订单必须属于本人
+# ---------------------------------------------------------------------------
+def test_fault_report_rejects_missing_gun(db):
+    owner = Actor(
+        account_id=104, user_id=1, roles=frozenset({"vehicle_owner"}), permissions=frozenset(),
+    )
+    with pytest.raises(BusinessError) as err:
+        service.create_fault_report(
+            db, actor=owner,
+            request=s.CreateFaultReportRequest(gun_id=999999, description="枪号不存在测试"),
+        )
+    assert err.value.status_code == 404
+
+
+def test_fault_report_rejects_other_users_order(db):
+    owner = Actor(
+        account_id=104, user_id=1, roles=frozenset({"vehicle_owner"}), permissions=frozenset(),
+    )
+    with pytest.raises(PermissionError):
+        service.create_fault_report(
+            db, actor=owner,
+            request=s.CreateFaultReportRequest(
+                gun_id=1, order_id=2, description="越权关联他人订单测试"
+            ),
+        )

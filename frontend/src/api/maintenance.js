@@ -20,9 +20,10 @@ export const createWorkOrder = (alertId, data) => http.post(`/maintenance/alerts
 export const appendWorkOrderEvent = (id, data) => http.post(`/maintenance/work-orders/${id}/events`, data)
 
 // ---------------- 设备上报 ----------------
-// 设备身份尚未接入时，这两个接口需要持有 maintenance.device_reading.read 的账号令牌。
-export const sendHeartbeat = data => http.post('/maintenance/heartbeats', data)
-export const uploadDeviceReading = data => http.post('/maintenance/readings', data)
+// 这两个接口用 X-Device-Token 识别设备身份，不能改用账号令牌。
+const deviceHeaders = token => ({ 'X-Device-Token': token })
+export const sendHeartbeat = (data, token) => http.post('/maintenance/heartbeats', data, { headers: deviceHeaders(token) })
+export const uploadDeviceReading = (data, token) => http.post('/maintenance/readings', data, { headers: deviceHeaders(token) })
 
 // ---------------- 报障 ----------------
 export const listFaultReports = params => http.get('/maintenance/fault-reports', { params })
@@ -37,6 +38,8 @@ export const createInspection = data => http.post('/maintenance/inspections', da
 
 // ---------------- 备件（V1.5） ----------------
 export const listSpareParts = params => http.get('/maintenance/spare-parts', { params })
+export const createPartUsage = data => http.post('/maintenance/part-usages', data)
+export const listPartUsages = workOrderId => http.get('/maintenance/part-usages', { params: { work_order_id: workOrderId } })
 export const stockInPart = data => http.post('/maintenance/part-stock-ins', data)
 export const listPartMovements = partId => http.get('/maintenance/part-movements', { params: { part_id: partId } })
 
@@ -47,6 +50,7 @@ export const getPerformance = () => http.get('/maintenance/stats/performance')
 export const listIncidents = () => http.get('/maintenance/incidents')
 export const declareIncident = params => http.post('/maintenance/incidents', null, { params })
 export const escalateIncidents = () => http.post('/maintenance/incidents/escalate')
+export const closeIncident = (id, summary) => http.post(`/maintenance/incidents/${id}/close`, null, { params: { summary } })
 
 // ---------------- 统计与运维任务（拓展） ----------------
 export const getOverview = () => http.get('/maintenance/stats/overview')

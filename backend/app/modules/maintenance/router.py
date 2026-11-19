@@ -240,7 +240,7 @@ def get_fault_report(db: Database, actor: CurrentActor, report_id: Annotated[int
 @router.post(
     "/fault-reports",
     summary="提交报障（车主）",
-    description="用当前登录账号关联的车主档案提交；客服与运维也可代提交。",
+    description="用当前登录账号关联的车主档案提交；账号未绑定车主档案时返回 400，客服与运维需以车主账号提交。",
     status_code=201,
     response_model=s.FaultReportDetail,
 )
@@ -300,7 +300,8 @@ def create_inspection(db: Database, actor: CurrentActor, request: s.CreateInspec
 @router.get(
     "/incidents",
     summary="事件看板",
-    description="返回事件级别、状态、关联告警数、未闭环工单数、响应与恢复耗时，以及是否突破 SLA。",
+    description="返回事件标题、级别、状态、关联告警数、未闭环工单数、响应与恢复耗时，以及是否突破 SLA。",
+    response_model=list[s.IncidentBoardItem],
 )
 def list_incidents(db: Database, actor: CurrentActor):
     return emergency.list_incident_board(db, actor=actor)
@@ -311,6 +312,7 @@ def list_incidents(db: Database, actor: CurrentActor):
     summary="声明应急事件",
     description="同场站同类别只允许一个进行中事件（生成列唯一键兜底）；声明后立即做一次升级扫描。",
     status_code=201,
+    response_model=s.IncidentCreated,
 )
 def declare_incident(
     db: Database,
@@ -333,6 +335,7 @@ def declare_incident(
     "/incidents/escalate",
     summary="执行一次升级扫描",
     description="按「级别 × 持续时长 × 影响桩数」匹配策略；同一事件同一策略只触发一次。",
+    response_model=s.EscalationResult,
 )
 def escalate(db: Database, actor: CurrentActor):
     return {"escalated": emergency.escalate_incidents(db, actor=actor)}
@@ -361,12 +364,13 @@ def stats_performance(db: Database, actor: CurrentActor):
 @router.post(
     "/tasks/{name}/run",
     summary="手动触发一次后台任务",
-    description="offline 心跳超时置离线；overdue 超时未接单升级；recovery 推进告警恢复；charging 充电中断；safety 严重告警停机派单；recurring 复发故障升级；inspection 巡检到期；temperature 高温预警；metering 计量异常；occupied 充满占位。",
+    description="offline 心跳超时置离线；overdue 超时未接单升级；recovery 推进告警恢复；charging 充电中断；safety 严重告警停机派单；recurring 复发故障升级；inspection 巡检到期；temperature 高温预警；metering 计量异常；occupied 充满占位；overload 场站功率过载；duration 长时间充电占位；voltage 电压越限；gun_mismatch 枪状态与订单不一致；fault_state_mismatch 故障标记未复位；sampling_gap 充电订单采样断流。",
+    response_model=s.TaskRunResult,
 )
 def run_task(
     db: Database,
     actor: CurrentActor,
-    name: Annotated[str, Path(pattern="^(offline|overdue|recovery|charging|safety|recurring|inspection|temperature|metering|occupied)$")],
+    name: Annotated[str, Path(pattern="^(offline|overdue|recovery|charging|safety|recurring|inspection|temperature|metering|occupied|overload|duration|voltage|gun_mismatch|fault_state_mismatch|sampling_gap)$")],
 ):
     return service.run_task(db, actor=actor, name=name)
 

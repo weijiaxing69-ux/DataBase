@@ -134,6 +134,7 @@ def _work_order_detail(db: Session, wo: m.WorkOrder) -> s.WorkOrderDetail:
         detail.accept_seconds = int((accepted - wo.assigned_at).total_seconds())
     if closed:
         detail.total_seconds = int((closed - wo.assigned_at).total_seconds())
+    detail.review_passed = dao.review_after_last_repair(db, wo.work_order_id)
     return detail
 
 
@@ -143,11 +144,16 @@ def _work_order_details(db: Session, rows) -> list:
     details = []
     for row in rows:
         detail = s.WorkOrderDetail.model_validate(row)
-        accepted, closed = summary.get(row.work_order_id, (None, None))
+        accepted, closed, repaired_at, reviewed_at = summary.get(
+            row.work_order_id, (None, None, None, None)
+        )
         if accepted:
             detail.accept_seconds = int((accepted - row.assigned_at).total_seconds())
         if closed:
             detail.total_seconds = int((closed - row.assigned_at).total_seconds())
+        detail.review_passed = (
+            repaired_at is not None and reviewed_at is not None and reviewed_at >= repaired_at
+        )
         details.append(detail)
     return details
 
@@ -200,7 +206,7 @@ def get_alarm_rule(db: Session, *, actor: Actor, alarm_rule_id: int) -> s.AlarmR
 
 
 def create_alarm_rule(db: Session, *, actor: Actor, request: s.CreateAlarmRuleRequest) -> s.AlarmRuleDetail:
-    _require(actor, PERM_RULE_MANAGE, PERM_ASSIGN)
+    security.require_permission(actor, PERM_RULE_MANAGE)
     with _tx(db):
         row = dao.create_alarm_rule(db, request)
         return s.AlarmRuleDetail.model_validate(row)
@@ -209,7 +215,7 @@ def create_alarm_rule(db: Session, *, actor: Actor, request: s.CreateAlarmRuleRe
 def update_alarm_rule(
     db: Session, *, actor: Actor, alarm_rule_id: int, request: s.UpdateAlarmRuleRequest
 ) -> s.AlarmRuleDetail:
-    _require(actor, PERM_RULE_MANAGE, PERM_ASSIGN)
+    security.require_permission(actor, PERM_RULE_MANAGE)
     with _tx(db):
         row = dao.get_alarm_rule(db, alarm_rule_id, for_update=True)
         if row is None:
@@ -323,13 +329,16 @@ def append_work_order_event(
                 f"工单当前状态为 {wo.status}，不能执行 {request.event_type}", status_code=409
             )
 
+        if request.event_type in ("review_passed", "review_failed") and not (request.review_result or "").strip():
+            raise ValueError("复核类事件必须填写复核依据")
+
         event_at = request.event_at or utcnow()
         if event_at < wo.assigned_at:
             raise ValueError("事件时间不能早于派单时间")
         if event_at > utcnow() + timedelta(minutes=5):
             raise ValueError("事件时间不能晚于当前时间")
-        if request.event_type == "closed" and not dao.has_event(db, work_order_id, "review_passed"):
-            raise BusinessError("闭环前必须有复核通过记录", status_code=409)
+        if request.event_type == "closed" and not dao.review_after_last_repair(db, work_order_id):
+            raise BusinessError("闭环前必须有本轮修复的复核通过记录", status_code=409)
 
         dao.add_event(
             db,
@@ -366,12 +375,14 @@ def receive_heartbeat(db: Session, *, device: DeviceActor, request: s.HeartbeatR
     """心跳：设备身份只能给自己绑定的桩上报。"""
     if request.pile_id != device.pile_id:
         raise PermissionError("设备凭据与上报的桩不一致")
+    now = request.reported_at or utcnow()
+    if now > utcnow() + timedelta(minutes=5):
+        raise BusinessError("心跳时间不能晚于服务器时间 5 分钟以上", status_code=400)
     with _tx(db):
         pile = dao.get_pile(db, request.pile_id, for_update=True)
         if pile is None:
             raise BusinessError("充电桩不存在", status_code=404)
 
-        now = request.reported_at or utcnow()
         if pile.last_heartbeat_at is not None and now <= pile.last_heartbeat_at:
             return s.HeartbeatAck(
                 pile_id=pile.pile_id, is_online=pile.is_online, server_time=utcnow(), duplicate=True
@@ -400,15 +411,18 @@ def ingest_device_reading(db: Session, *, device: DeviceActor, request: s.Device
     """采样：同桩同时刻只保留一条，重复上报返回 duplicate=true。"""
     if request.pile_id != device.pile_id:
         raise PermissionError("设备凭据与上报的桩不一致")
+    if request.sampled_at > utcnow() + timedelta(minutes=5):
+        raise BusinessError("采样时间不能晚于服务器时间 5 分钟以上", status_code=400)
     with _tx(db):
         pile = dao.get_pile(db, request.pile_id)
         if pile is None:
             raise BusinessError("充电桩不存在", status_code=404)
         try:
-            row = dao.insert_reading(db, request)
+            with db.begin_nested():
+                row = dao.insert_reading(db, request)
         except IntegrityError:
-            # 唯一键 (pile_id, sampled_at) 兜住并发重复上报
-            db.rollback()
+            # 唯一键 (pile_id, sampled_at) 兜住并发重复上报；
+            # 用保存点回滚这一条，不影响外层事务
             return s.ReadingAck(sample_id=0, accepted=False, duplicate=True)
         generated = dao.count_alerts_since(
             db, request.pile_id, request.sampled_at - timedelta(seconds=1)
@@ -439,6 +453,17 @@ def create_fault_report(db: Session, *, actor: Actor, request: s.CreateFaultRepo
     if not actor.user_id:
         raise ValueError("当前账号未绑定车主档案，不能提交报障")
     with _tx(db):
+        if dao.gun_pile_id(db, request.gun_id) is None:
+            raise BusinessError("充电枪不存在", status_code=404)
+        if request.order_id is not None:
+            owner = db.execute(
+                text("select user_id from charging_order where order_id = :oid"),
+                {"oid": request.order_id},
+            ).scalar_one_or_none()
+            if owner is None:
+                raise BusinessError("关联订单不存在", status_code=404)
+            if owner != actor.user_id:
+                raise PermissionError("只能关联自己的订单")
         row = dao.create_fault_report(db, user_id=actor.user_id, payload=request)
         return s.FaultReportDetail.model_validate(row)
 
@@ -623,7 +648,7 @@ def run_task(db: Session, *, actor: Actor, name: str) -> dict:
         raise PermissionError("只有平台管理员可以手动触发后台任务")
     fn = TASKS.get(name)
     if fn is None:
-        raise ValueError(f"未知任务：{name}，可选 offline / overdue")
+        raise ValueError(f"未知任务：{name}，可选 {' / '.join(sorted(TASKS))}")
     now = utcnow()
     started = time.perf_counter()
     affected = fn(db, now=now)
@@ -664,23 +689,25 @@ def create_part_usage(db: Session, *, actor: Actor, request: s.CreatePartUsageRe
         part = dao.get_spare_part(db, request.part_id, for_update=True)
         if part is None:
             raise BusinessError("备件不存在", status_code=404)
+        if part.status != "active":
+            raise BusinessError("备件已停用，不能领用", status_code=409)
         if part.station_id is not None:
             security.assert_resource_scope(db, actor, resource_type="station", resource_id=part.station_id)
             wo_station = _station_of_work_order(db, wo)
             if wo_station is not None and part.station_id != wo_station:
                 raise BusinessError("备件所属场站与工单不一致，不能跨站领用", status_code=409)
         try:
-            row = dao.create_part_usage(
-                db,
-                work_order_id=request.work_order_id,
-                part_id=request.part_id,
-                qty=request.qty,
-                used_at=utcnow(),
-                used_by=actor.account_id,
-                note=request.note,
-            )
+            with db.begin_nested():
+                row = dao.create_part_usage(
+                    db,
+                    work_order_id=request.work_order_id,
+                    part_id=request.part_id,
+                    qty=request.qty,
+                    used_at=utcnow(),
+                    used_by=actor.account_id,
+                    note=request.note,
+                )
         except DBAPIError as exc:
-            db.rollback()
             raise BusinessError("备件库存不足，领用失败", status_code=409) from exc
         return s.PartUsageDetail.model_validate(row)
 
@@ -820,6 +847,8 @@ def stock_in_part(db: Session, *, actor: Actor, request: s.StockInRequest):
         part = dao.get_spare_part(db, request.part_id, for_update=True)
         if part is None:
             raise BusinessError("备件不存在", status_code=404)
+        if part.status != "active":
+            raise BusinessError("备件已停用，不能入库", status_code=409)
         if part.station_id is not None:
             security.assert_resource_scope(db, actor, resource_type="station", resource_id=part.station_id)
         part.stock_qty += request.qty
@@ -966,6 +995,192 @@ def check_idle_occupied(db: Session, *, now: Optional[datetime] = None, minutes:
     return created
 
 
+def check_station_overload(
+    db: Session, *, now: Optional[datetime] = None,
+    window_minutes: int = 10, threshold_kw: float = 300.0,
+) -> int:
+    """场站多桩同时快充导致台区功率超阈值：按场站聚合并建一条告警。"""
+    now = now or utcnow()
+    rule = dao.rule_by_fault_code(db, "CAP01")
+    if rule is None:
+        return 0
+    created = 0
+    with _tx(db):
+        for row in dao.list_overloaded_stations(
+            db, now - timedelta(minutes=window_minutes), threshold_kw
+        ):
+            if dao.insert_alert(
+                db, pile_id=row["pile_id"], gun_id=None, rule=rule,
+                alert_code="CAP01", occurred_at=now,
+            ):
+                created += 1
+        db.flush()
+    return created
+
+
 TASKS["temperature"] = check_temperature_warning
 TASKS["metering"] = check_metering_anomaly
 TASKS["occupied"] = check_idle_occupied
+TASKS["overload"] = check_station_overload
+
+
+# ---------------------------------------------------------------------------
+# 生活场景增量：长时间充电占位、电压越限
+# ---------------------------------------------------------------------------
+def check_long_charging(
+    db: Session, *, now: Optional[datetime] = None, minutes: int = 240,
+) -> int:
+    """订单充电超过时长阈值：车主忘拔枪、慢充过夜占位，提醒场站联系车主。"""
+    now = now or utcnow()
+    created = 0
+    with _tx(db):
+        for row in dao.list_long_charging_orders(db, now - timedelta(minutes=minutes), now):
+            account_id, _ = dao.on_call_accounts(db, row["station_id"], now)
+            if dao.notify(
+                db,
+                account_id=account_id,
+                notification_type="long_charging",
+                business_key=f"long_charge:{row['order_id']}:{now.strftime('%Y-%m-%d')}",
+                title="充电订单超时占位",
+                content=(
+                    f"订单 #{row['order_id']} 已连续充电 {minutes} 分钟以上，"
+                    "请联系车主确认是否已充满未拔枪，避免占用车位与枪头"
+                ),
+                target_path="/maintenance/alerts",
+            ):
+                created += 1
+        db.flush()
+    return created
+
+
+def check_voltage_anomaly(
+    db: Session, *, now: Optional[datetime] = None,
+    window_minutes: int = 10, lower_v: float = 300.0, upper_v: float = 1000.0,
+    amps: float = 1.0, samples: int = 2,
+) -> int:
+    """有输出电流但电压连续越限：电网波动、枪头接触不良、整流异常。"""
+    now = now or utcnow()
+    rule = dao.rule_by_fault_code(db, "VLT01")
+    if rule is None:
+        return 0
+    created = 0
+    with _tx(db):
+        for row in dao.list_voltage_anomalies(
+            db, now - timedelta(minutes=window_minutes), lower_v, upper_v, amps, samples
+        ):
+            if dao.insert_alert(
+                db, pile_id=row["pile_id"], gun_id=None, rule=rule,
+                alert_code="VLT01", occurred_at=now,
+            ):
+                created += 1
+        db.flush()
+    return created
+
+
+TASKS["duration"] = check_long_charging
+TASKS["voltage"] = check_voltage_anomaly
+
+
+def check_gun_order_mismatch(
+    db: Session, *, now: Optional[datetime] = None, minutes: int = 30,
+) -> int:
+    """枪状态与订单不一致：车主提前拔枪、枪锁卡住、枪状态未复位。"""
+    now = now or utcnow()
+    created = 0
+    with _tx(db):
+        for row in dao.list_gun_order_mismatches(db, now - timedelta(minutes=minutes)):
+            if row["mismatch_type"] == "order_active_gun_not_occupied":
+                title = "充电订单与枪状态不一致"
+                content = (
+                    f"订单 #{row['order_id']} 仍在充电，但枪 #{row['gun_id']} 状态为 "
+                    f"{row['gun_status']}。请核实是否车主提前拔枪或枪锁未复位；"
+                    "确认后人工复位枪状态，并同步处理订单计费。"
+                )
+            else:
+                title = "枪占用但无进行中订单"
+                content = (
+                    f"枪 #{row['gun_id']} 显示占用但没有进行中订单，且上一单已结束超过 "
+                    f"{minutes} 分钟。请核实是否枪锁卡住或枪状态未归位，必要时人工复位。"
+                )
+            account_id, _ = dao.on_call_accounts(db, row["station_id"], now)
+            if dao.notify(
+                db,
+                account_id=account_id,
+                notification_type="gun_order_mismatch",
+                business_key=(
+                    f"gun_mismatch:{row['gun_id']}:{row['mismatch_type']}:"
+                    f"{now.strftime('%Y-%m-%d')}"
+                ),
+                title=title,
+                content=content,
+                target_path="/maintenance/alerts",
+            ):
+                created += 1
+        db.flush()
+    return created
+
+
+TASKS["gun_mismatch"] = check_gun_order_mismatch
+
+
+# ---------------------------------------------------------------------------
+# 生活场景闭环：故障标记未复位、采样断流
+# ---------------------------------------------------------------------------
+def check_fault_state_mismatch(db: Session, *, now: Optional[datetime] = None) -> int:
+    """桩/枪有故障标记但状态不是 fault：提醒核实是否维修后未复位。"""
+    now = now or utcnow()
+    created = 0
+    with _tx(db):
+        for row in dao.list_fault_state_mismatches(db):
+            label = "枪" if row["target_type"] == "gun" else "桩"
+            if dao.notify(
+                db,
+                account_id=dao.on_call_accounts(db, row["station_id"], now)[0],
+                notification_type="fault_state_mismatch",
+                business_key=(
+                    f"fault_state:{row['target_type']}:{row['target_id']}:"
+                    f"{now.strftime('%Y-%m-%d')}"
+                ),
+                title="设备故障标记未复位",
+                content=(
+                    f"{label} #{row['target_id']} 存在故障标记，但当前状态为 "
+                    f"{row['current_status']}。请核实是否维修后未复位；"
+                    "若仍异常，请改为 fault 并停止服务。"
+                ),
+                target_path="/maintenance/alerts",
+            ):
+                created += 1
+        db.flush()
+    return created
+
+
+def check_order_sampling_gap(
+    db: Session, *, now: Optional[datetime] = None, minutes: int = 10,
+) -> int:
+    """订单在充但最近没有新采样：通信中断、采样链路卡住或设备假在线。"""
+    now = now or utcnow()
+    created = 0
+    with _tx(db):
+        for row in dao.list_order_sampling_gaps(
+            db, now - timedelta(minutes=minutes), now - timedelta(minutes=minutes)
+        ):
+            if dao.notify(
+                db,
+                account_id=dao.on_call_accounts(db, row["station_id"], now)[0],
+                notification_type="sampling_gap",
+                business_key=f"sampling_gap:{row['order_id']}:{now.strftime('%Y-%m-%d')}",
+                title="充电订单采样断流",
+                content=(
+                    f"订单 #{row['order_id']} 仍在充电，但近 {minutes} 分钟没有新采样。"
+                    "请核实通信、采样链路或设备状态；如确认已中断，"
+                    "请按充电中断流程处理。"
+                ),
+                target_path="/maintenance/alerts",
+            ):
+                created += 1
+        db.flush()
+    return created
+
+
+TASKS["fault_state_mismatch"] = check_fault_state_mismatch
+TASKS["sampling_gap"] = check_order_sampling_gap

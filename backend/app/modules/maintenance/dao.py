@@ -183,7 +183,7 @@ def add_event(
 
 
 def event_summaries(db: Session, work_order_ids: Sequence[int]) -> dict[int, tuple]:
-    """一次查询取回一页工单的「首次接单」与「首次闭环」时间。"""
+    """一次查询取回一页工单的接单、闭环、末次修复与末次复核时间。"""
     if not work_order_ids:
         return {}
     rows = db.execute(
@@ -191,11 +191,13 @@ def event_summaries(db: Session, work_order_ids: Sequence[int]) -> dict[int, tup
             m.WorkOrderEvent.work_order_id,
             func.min(case((m.WorkOrderEvent.event_type == "accepted", m.WorkOrderEvent.event_at))),
             func.min(case((m.WorkOrderEvent.event_type == "closed", m.WorkOrderEvent.event_at))),
+            func.max(case((m.WorkOrderEvent.event_type == "repaired", m.WorkOrderEvent.event_at))),
+            func.max(case((m.WorkOrderEvent.event_type == "review_passed", m.WorkOrderEvent.event_at))),
         )
         .where(m.WorkOrderEvent.work_order_id.in_(list(work_order_ids)))
         .group_by(m.WorkOrderEvent.work_order_id)
     ).all()
-    return {row[0]: (row[1], row[2]) for row in rows}
+    return {row[0]: (row[1], row[2], row[3], row[4]) for row in rows}
 
 
 def first_event_at(db: Session, work_order_id: int, event_type: str):
@@ -320,8 +322,11 @@ def log_status(
 def notify(
     db: Session, *, account_id: int, notification_type: str, business_key: str,
     title: str, content: str, target_path: str,
-) -> None:
-    """站内待办。同一账号同一业务键只保留一条（库内唯一索引兜底）。"""
+) -> bool:
+    """站内待办。同一账号同一业务键只保留一条（库内唯一索引兜底）。
+
+    返回 True 表示本次真正写入；重复业务键被忽略时返回 False。
+    """
     stmt = mysql_insert(m.Notification).values(
         account_id=account_id,
         notification_type=notification_type,
@@ -565,6 +570,18 @@ def has_event(db: Session, work_order_id: int, event_type: str) -> bool:
             m.WorkOrderEvent.event_type == event_type,
         )
     ).scalar_one() > 0
+
+
+def review_after_last_repair(db: Session, work_order_id: int) -> bool:
+    """当前这轮修复是否已复核通过；复核失败后重修必须重新复核。"""
+    row = db.execute(
+        select(
+            func.max(case((m.WorkOrderEvent.event_type == "repaired", m.WorkOrderEvent.event_at))),
+            func.max(case((m.WorkOrderEvent.event_type == "review_passed", m.WorkOrderEvent.event_at))),
+        ).where(m.WorkOrderEvent.work_order_id == work_order_id)
+    ).one()
+    repaired_at, reviewed_at = row
+    return repaired_at is not None and reviewed_at is not None and reviewed_at >= repaired_at
 
 
 def account_roles(db: Session, account_id: int) -> set[str]:
@@ -889,3 +906,149 @@ def gun_pile_id(db: Session, gun_id: int) -> Optional[int]:
     return db.execute(
         text("select pile_id from charging_gun where gun_id = :g"), {"g": gun_id}
     ).scalar_one_or_none()
+
+
+def list_long_charging_orders(db: Session, before, now):
+    """进行中且已超过指定时长的订单：车主忘拔枪、慢充过夜占位等。"""
+    rows = db.execute(
+        text(
+            """select o.order_id, o.gun_id, o.station_id, o.started_at,
+                      timestampdiff(second, o.started_at, :now) as charging_seconds
+                 from charging_order o
+                where o.status = 'charging'
+                  and o.started_at <= :before
+                order by o.started_at"""
+        ),
+        {"before": before, "now": now},
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def list_voltage_anomalies(db: Session, since, lower_v: float, upper_v: float, amps: float, samples: int):
+    """有输出电流但电压越限：电网波动、接触不良、整流异常。"""
+    rows = db.execute(
+        text(
+            """select r.pile_id,
+                      min(r.output_voltage_v) as min_voltage,
+                      max(r.output_voltage_v) as max_voltage,
+                      count(*) as n
+                 from device_reading r
+                where r.sampled_at >= :since
+                  and r.output_current_a > :amps
+                  and (r.output_voltage_v < :lower_v or r.output_voltage_v > :upper_v)
+                group by r.pile_id
+               having count(*) >= :samples"""
+        ),
+        {"since": since, "lower_v": lower_v, "upper_v": upper_v,
+         "amps": amps, "samples": samples},
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def list_gun_order_mismatches(db: Session, before):
+    """枪状态与订单状态不一致：有订单但枪非占用、枪占用但无进行中订单。"""
+    rows = db.execute(
+        text(
+            """select o.order_id, g.gun_id, p.pile_id, o.station_id,
+                      'order_active_gun_not_occupied' as mismatch_type,
+                      g.status as gun_status, o.status as order_status, o.started_at
+                 from charging_order o
+                 join charging_gun g on g.gun_id = o.gun_id
+                 join charging_pile p on p.pile_id = g.pile_id
+                where o.status = 'charging'
+                  and g.status <> 'occupied'
+                union all
+                select cast(null as unsigned) as order_id, g.gun_id, p.pile_id,
+                       p.station_id,
+                       'gun_occupied_no_order' as mismatch_type,
+                       g.status as gun_status,
+                       cast(null as char) as order_status,
+                       cast(null as datetime(3)) as started_at
+                  from charging_gun g
+                  join charging_pile p on p.pile_id = g.pile_id
+                  left join charging_order o on o.gun_id = g.gun_id
+                 where g.status = 'occupied'
+                   and not exists (select 1 from charging_order o2
+                                    where o2.gun_id = g.gun_id
+                                      and o2.status = 'charging')
+                 group by g.gun_id, p.pile_id, p.station_id, g.status
+                having coalesce(max(o.finished_at), '1970-01-01 00:00:00') <= :before"""
+        ),
+        {"before": before},
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def list_fault_state_mismatches(db: Session):
+    """桩/枪存在故障标记，但状态不是 fault：常见于维修后没有复位或状态被误改。"""
+    rows = db.execute(
+        text(
+            """select p.station_id, 'pile' as target_type,
+                      p.pile_id as target_id, p.status as current_status
+                 from charging_pile p
+                where p.has_fault = 1
+                  and p.status not in ('fault', 'offline')
+                union all
+                select p.station_id, 'gun' as target_type,
+                       g.gun_id as target_id, g.status as current_status
+                  from charging_gun g
+                  join charging_pile p on p.pile_id = g.pile_id
+                 where g.has_fault = 1
+                   and g.status not in ('fault', 'offline')"""
+        ),
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def list_order_sampling_gaps(db: Session, since, before):
+    """进行中订单但最近没有新采样：通信中断、采样链路卡住或设备假在线。"""
+    rows = db.execute(
+        text(
+            """select o.order_id, o.gun_id, g.pile_id, p.station_id
+                 from charging_order o
+                 join charging_gun g on g.gun_id = o.gun_id
+                 join charging_pile p on p.pile_id = g.pile_id
+                where o.status = 'charging'
+                  and p.is_online = 1
+                  and o.started_at <= :before
+                  and not exists (
+                        select 1 from device_reading r
+                         where r.pile_id = g.pile_id
+                           and r.sampled_at >= :since
+                  )
+                order by o.order_id"""
+        ),
+        {"since": since, "before": before},
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def list_overloaded_stations(db: Session, since, threshold_kw: float):
+    """场站级功率过载：先按桩取窗口内峰值，再按场站求和，返回超阈值的场站与代表桩。
+
+    代表桩取该场站峰值功率最高的桩，避免同一场站重复建多告警。
+    """
+    rows = db.execute(
+        text(
+            """select s.station_id, s.station_name, t.pile_id,
+                      t.pile_peak_kw, t.station_peak_kw
+                 from (
+                   select a.station_id, a.pile_id, a.pile_peak_kw,
+                          sum(a.pile_peak_kw) over (partition by a.station_id) as station_peak_kw,
+                          row_number() over (
+                            partition by a.station_id order by a.pile_peak_kw desc, a.pile_id
+                          ) as rn
+                     from (
+                       select p.station_id, r.pile_id, max(r.power_kw) as pile_peak_kw
+                         from device_reading r
+                         join charging_pile p on p.pile_id = r.pile_id
+                        where r.sampled_at >= :since
+                        group by p.station_id, r.pile_id
+                     ) a
+                 ) t
+                 join station s on s.station_id = t.station_id
+                where t.rn = 1 and t.station_peak_kw > :threshold"""
+        ),
+        {"since": since, "threshold": threshold_kw},
+    ).mappings().all()
+    return [dict(r) for r in rows]

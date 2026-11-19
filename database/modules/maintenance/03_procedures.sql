@@ -90,6 +90,8 @@ begin
   declare v_alert_id bigint unsigned;
   declare v_pending_orders int default 0;
   declare v_normal_since datetime(3);
+  declare v_last_repaired datetime(3);
+  declare v_last_reviewed datetime(3);
 
   select status, alert_id
     into v_status, v_alert_id
@@ -105,12 +107,15 @@ begin
     signal sqlstate '45000' set message_text = '只有已修复(repaired)的工单可以闭环';
   end if;
 
-  if not exists (
-       select 1 from work_order_event
-        where work_order_id = p_work_order_id
-          and event_type = 'review_passed'
-     ) then
-    signal sqlstate '45000' set message_text = '闭环前必须存在复核通过(review_passed)事件';
+  -- 必须复核的是本轮修复：复核失败后重修，旧复核记录不能用于再次闭环
+  select max(case when event_type = 'repaired' then event_at end),
+         max(case when event_type = 'review_passed' then event_at end)
+    into v_last_repaired, v_last_reviewed
+    from work_order_event
+   where work_order_id = p_work_order_id;
+
+  if v_last_repaired is null or v_last_reviewed is null or v_last_reviewed < v_last_repaired then
+    signal sqlstate '45000' set message_text = '闭环前必须有本轮修复的复核通过(review_passed)事件';
   end if;
 
   insert into work_order_event
