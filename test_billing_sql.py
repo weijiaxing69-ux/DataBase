@@ -1,10 +1,13 @@
 """Live MySQL verification for member 2 database deliverables."""
 from pathlib import Path
+from contextlib import contextmanager
 
 import pytest
 import pymysql
 
+import backend
 from db_connection import connect
+from backend import verify_billing_runtime
 
 QUERY_FILE = Path(__file__).resolve().parent / "database" / "modules" / "billing" / "08_queries.sql"
 
@@ -33,6 +36,54 @@ def test_views_and_query_pairs_match_with_explain():
                 assert results[0] == results[1], f"Q{pair} pair differs"
     finally:
         db.close()
+
+
+def test_application_startup_database_objects_are_installed():
+    """The scheduled cleanup must never be silently disabled by a partial SQL install."""
+    assert verify_billing_runtime() == {
+        "procedure": ["sp_billing_expire_unpaid"],
+        "trigger": ["trg_billing_meter_reading_validate"],
+        "view": [
+            "v_billing_order_balance",
+            "v_billing_pending_collection",
+            "v_billing_period_revenue",
+        ],
+    }
+
+
+def test_scheduled_expiry_drains_procedure_results_before_next_statement(monkeypatch):
+    """A procedure call must finish before cleanup uses the same MySQL cursor."""
+    events = []
+
+    class Cursor:
+        def __init__(self):
+            self.next_sets = iter((True, False))
+
+        def execute(self, statement):
+            events.append(statement)
+
+        def nextset(self):
+            events.append("NEXTSET")
+            return next(self.next_sets)
+
+        def fetchone(self):
+            return {"expired_count": 2}
+
+    cursor = Cursor()
+
+    @contextmanager
+    def fake_transaction():
+        yield cursor
+
+    monkeypatch.setattr(backend, "transaction", fake_transaction)
+    assert backend.run_expire_unpaid() == 2
+    assert events == [
+        "CALL sp_billing_expire_unpaid(UTC_TIMESTAMP(3), @billing_expired_count)",
+        "NEXTSET",
+        "NEXTSET",
+        "SELECT @billing_expired_count AS expired_count",
+        "DELETE FROM request_dedup WHERE expires_at < UTC_TIMESTAMP(3)",
+    ]
 
 
 def insert_order(cur, status, due=None):

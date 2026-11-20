@@ -1,9 +1,14 @@
 .venv/
 .idea/
+.run/
 .swagger-vendor/
 __pycache__/
 .pytest_cache/
 frontend/node_modules/
 frontend/dist/
+.env
+.env.*
+!.env.example
+*.log
 demo-login.txt
 test-results.txt

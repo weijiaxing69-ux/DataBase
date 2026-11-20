@@ -31,20 +31,58 @@ async def expire_unpaid_loop():
     """Run the installed SQL procedure until the API stops."""
     while True:
         try:
-            await asyncio.to_thread(run_expire_unpaid)
+            expired = await asyncio.to_thread(run_expire_unpaid)
+            if expired:
+                logging.info("订单到期释放任务已取消 %s 笔未支付订单", expired)
         except Exception:
             logging.exception("订单到期释放任务失败")
         await asyncio.sleep(60)
 
 
 def run_expire_unpaid():
+    """Run the database-owned expiry workflow and return its affected-order count."""
     with transaction() as cur:
         cur.execute("CALL sp_billing_expire_unpaid(UTC_TIMESTAMP(3), @billing_expired_count)")
+        while cur.nextset():
+            pass
+        cur.execute("SELECT @billing_expired_count AS expired_count")
+        expired = cur.fetchone()["expired_count"]
         cur.execute("DELETE FROM request_dedup WHERE expires_at < UTC_TIMESTAMP(3)")
+        return int(expired or 0)
+
+
+def verify_billing_runtime():
+    """Fail at startup when the module SQL was not installed into this database."""
+    required = {
+        "procedure": {"sp_billing_expire_unpaid"},
+        "trigger": {"trg_billing_meter_reading_validate"},
+        "view": {"v_billing_order_balance", "v_billing_pending_collection", "v_billing_period_revenue"},
+    }
+    db = connect()
+    try:
+        with db.cursor() as cur:
+            cur.execute("SELECT routine_name AS object_name FROM information_schema.routines "
+                        "WHERE routine_schema=DATABASE() AND routine_name=%s", ("sp_billing_expire_unpaid",))
+            found_procedure = {row["object_name"] for row in cur.fetchall()}
+            cur.execute("SELECT trigger_name AS object_name FROM information_schema.triggers "
+                        "WHERE trigger_schema=DATABASE() AND trigger_name=%s", ("trg_billing_meter_reading_validate",))
+            found_trigger = {row["object_name"] for row in cur.fetchall()}
+            cur.execute("SELECT table_name AS object_name FROM information_schema.views "
+                        "WHERE table_schema=DATABASE() AND table_name LIKE 'v_billing_%'")
+            found_view = {row["object_name"] for row in cur.fetchall()}
+    finally:
+        db.close()
+    found = {"procedure": found_procedure, "trigger": found_trigger, "view": found_view}
+    missing = [name for kind, names in required.items() for name in names - found[kind]]
+    if missing:
+        raise RuntimeError("计费模块数据库对象缺失：" + "、".join(sorted(missing))
+                           + "。请先运行 install_billing_sql.py。")
+    return {kind: sorted(found[kind] & names) for kind, names in required.items()}
 
 
 @asynccontextmanager
 async def billing_lifespan(application):
+    await asyncio.to_thread(verify_billing_runtime)
     worker = asyncio.create_task(expire_unpaid_loop())
     try:
         yield
