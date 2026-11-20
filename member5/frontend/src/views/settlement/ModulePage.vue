@@ -2,6 +2,7 @@
 import { computed, inject, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { billItems, pages } from './pages'
+import { listAuditEvents } from '../../api/settlement'
 
 const route = useRoute()
 const page = pages[route.meta.section]
@@ -10,6 +11,25 @@ const allowed = computed(() => has(...page.roles))
 const filters = ref({})
 const results = ref({ items: [], total: 0, page: 1, page_size: 20 })
 const details = ref(null)
+const audit = ref([])
+const auditPage = ref(1)
+const auditTotal = ref(0)
+const auditKinds = { DifferenceList: 'difference', InvoiceList: 'operator_invoice',
+  UserInvoiceList: 'user_invoice', AdjustmentList: 'adjustment' }
+const auditNames = { resolve: '提交处理结论', request: '提交调整申请', review: '审批调整',
+  process: '办理发票', red_issue: '红冲' }
+const stateNames = { resolution: '处理结论', version: '版本', status: '状态',
+  settlement_id: '结算单', difference_id: '差异单', amount: '金额', reason: '原因',
+  settlement_version: '结算版本', payable_amount: '应结金额', red_invoice_id: '红票编号' }
+const stateText = state => Object.entries(state).map(([key, value]) =>
+  (stateNames[key] || key) + '：' + display(value)).join('；')
+async function loadAudit(number = 1) {
+  const result = await listAuditEvents(token.value, { object_type: auditKinds[route.meta.section],
+    object_id: details.value[page.key], page: number })
+  audit.value = result.items
+  auditTotal.value = result.total
+  auditPage.value = number
+}
 const action = ref(null)
 const data = ref({})
 const busy = ref(false)
@@ -18,7 +38,8 @@ const notice = ref('')
 const labels = { draft: '草稿', active: '已启用', disabled: '已停用', issued: '已开具',
   requested: '待办理', red_issued: '已红冲', rejected: '已拒绝或有异议', open: '待处理',
   pending_confirmation: '待确认', effective: '已生效', partially_paid: '部分收款', paid: '已结清',
-  closed: '已关闭', energy: '电量', price: '价格', payment: '支付', blue: '蓝票', red: '红票',
+  closed: '已关闭', pending: '待审批', approved: '已批准',
+  energy: '电量', price: '价格', payment: '支付', blue: '蓝票', red: '红票',
   order: '订单', refund: '退款', credit_carry: '负额结转', adjustment: '调整' }
 const display = value => labels[value] || (value ?? '—')
 const addAllocation = () => data.value.items.push({ order_id: '', allocated_amount: '' })
@@ -43,6 +64,11 @@ async function run(callback) {
 async function load(number = results.value.page) {
   results.value = await page.list(token.value, { ...convert(filters.value, mainFields.value), page: number })
 }
+async function openDetail(row) {
+  details.value = await page.detail(token.value, row[page.key])
+  audit.value = []
+  if (auditKinds[route.meta.section]) await loadAudit()
+}
 function select(next, row = null) {
   action.value = { ...next, row }
   data.value = Object.fromEntries(next.fields.map(f => [f.name, f.type === 'allocations'
@@ -56,7 +82,7 @@ async function submit() {
   if (route.params.billId) details.value = await page.detail(token.value, route.params.billId)
   else {
     await load()
-    if (details.value) details.value = await page.detail(token.value, details.value[page.key])
+    if (details.value) await openDetail(details.value)
   }
   notice.value = result.adjustment_id ? `调整申请 #${result.adjustment_id} 已提交，请交由另一账号审批。` : '操作成功。'
 }
@@ -128,7 +154,7 @@ onMounted(() => {
                 <td v-for="(_, key) in page.columns" :key="key">{{ display(row[key]) }}</td>
                 <td class="row-actions">
                   <RouterLink v-if="page.route" :to="{ name: page.route, params: { billId: row.bill_id } }">查看</RouterLink>
-                  <button v-else class="link" :disabled="busy" @click="run(async () => { details = await page.detail(token, row[page.key]) })">查看</button>
+                  <button v-else class="link" :disabled="busy" @click="run(() => openDetail(row))">查看</button>
                   <template v-for="op in page.actions" :key="op.label">
                     <button v-if="has(...op.roles) && op.when(row)" class="link" :disabled="busy" @click="select(op, row)">{{ op.label }}</button>
                   </template>
@@ -153,6 +179,20 @@ onMounted(() => {
         <dl class="detail-grid"><template v-for="(label, key) in page.columns" :key="key">
           <dt>{{ label }}</dt><dd>{{ display(details[key]) }}</dd>
         </template></dl>
+        <section v-if="auditKinds[route.meta.section]">
+          <h3>操作记录</h3>
+          <p v-if="!audit.length">暂无操作记录（历史数据不会补造记录）。</p>
+          <article v-for="item in audit" :key="item.event_id" class="card">
+            <p>{{ item.created_at }} · 操作人 #{{ item.actor_id }} · {{ auditNames[item.action] || item.action }}</p>
+            <p v-if="item.note">说明：{{ item.note }}</p>
+            <p v-if="item.before_state">修改前：{{ stateText(item.before_state) }}</p>
+            <p v-if="item.after_state">修改后：{{ stateText(item.after_state) }}</p>
+          </article>
+          <div v-if="auditTotal > 20" class="pager">
+            <button :disabled="busy || auditPage <= 1" @click="run(() => loadAudit(auditPage-1))">上一页记录</button>
+            <button :disabled="busy || auditPage*20 >= auditTotal" @click="run(() => loadAudit(auditPage+1))">下一页记录</button>
+          </div>
+        </section>
         <div v-if="details.items" class="table-scroll">
           <h3>月结明细</h3>
           <table>

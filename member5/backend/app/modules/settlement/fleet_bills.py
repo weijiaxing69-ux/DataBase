@@ -117,6 +117,10 @@ def generate_fleet_bill(db, *, actor, request):
     for old in all_rows(db, """SELECT * FROM fleet_monthly_bill b WHERE fleet_id=:fid AND bill_month<:month
         AND payable_amount<0 AND status='issued' AND NOT EXISTS(SELECT 1 FROM fleet_monthly_bill_item i
         WHERE i.source_bill_id=b.bill_id) ORDER BY bill_month FOR UPDATE""", fid=fid, month=request.bill_month):
+        # Repair an older negative bill before closing it: its positive orders
+        # must consume their part of the credit before only the remainder carries.
+        if old["order_amount"] > 0:
+            settle_credit_only(db, actor, old)
         remaining = -old["payable_amount"]
         for i in add_items(db, old)["items"]:
             amount = min(remaining, -i["amount"])
@@ -138,7 +142,15 @@ def generate_fleet_bill(db, *, actor, request):
         execute(db, """INSERT INTO fleet_monthly_bill_item(bill_id,order_id,refund_id,item_type,
             occurred_at,amount,original_order_finished_at,business_key,source_bill_id)
             VALUES(:id,:oid,:refund,:kind,:at,:amount,:original,:key,:source)""", id=result.lastrowid, **i)
+    if due <= 0 and base > 0:
+        settle_credit_only(db, actor, bill_row(db, result.lastrowid))
     return add_items(db, bill_row(db, result.lastrowid))
+
+
+def settle_credit_only(db, actor, bill):
+    from .schemas import FleetBillPaymentRequest
+    record_fleet_bill_payment(db, actor=actor, bill_id=bill["bill_id"],
+        request=FleetBillPaymentRequest(external_trade_no=f"credit-only:{bill['bill_id']}", amount=0))
 
 
 def apply_fleet_refund_credit(db, *, refund_id: int):
@@ -178,8 +190,8 @@ def record_fleet_bill_payment(db, *, actor, bill_id, request):
                 409, "FLEET_PAYMENT_CONFLICT", "该流水号已用于其他收款。")
         return old
     require(bill["status"] in ("issued", "partially_paid") and
-            request.amount <= bill["payable_amount"]-bill["paid_amount"]
-            and (request.amount > 0 or (bill["payable_amount"] == bill["paid_amount"]
+            request.amount <= max(bill["payable_amount"]-bill["paid_amount"], Decimal(0))
+            and (request.amount > 0 or (bill["payable_amount"] <= bill["paid_amount"]
                  and bill["order_amount"] > 0 and bill["adjustment_amount"] < 0)), 409,
             "INVALID_FLEET_PAYMENT", "金额超过应收余额，或账单当前不可收款。")
     ids = [i["order_id"] for i in add_items(db, bill)["items"] if i["item_type"] == "order"]
@@ -189,8 +201,16 @@ def record_fleet_bill_payment(db, *, actor, bill_id, request):
     pid = result.lastrowid
     cash = request.amount
     credit = Decimal(0)
-    if bill["paid_amount"] + cash == bill["payable_amount"]:
-        credit = max(-bill["adjustment_amount"], Decimal(0))
+    if bill["paid_amount"] + cash >= bill["payable_amount"]:
+        used = one(db, """SELECT COALESCE(SUM(p.fleet_credit_amount),0) AS n
+            FROM payment_record p JOIN fleet_bill_payment b USING(bill_payment_id)
+            WHERE b.bill_id=:id AND p.status='succeeded'""", id=bill_id)["n"]
+        available = max(-bill["adjustment_amount"]-used, Decimal(0))
+        remaining_orders = sum(max(o["payable_amount"]-one(db,
+            "SELECT COALESCE(SUM(amount),0) AS n FROM payment_record "
+            "WHERE order_id=:id AND status='succeeded'", id=oid)["n"], Decimal(0))
+            for oid, o in orders.items())
+        credit = min(available, max(remaining_orders-cash, Decimal(0)))
     allocations = []
     for oid in ids:
         order = orders[oid]
@@ -209,5 +229,6 @@ def record_fleet_bill_payment(db, *, actor, bill_id, request):
     apply_fleet_bill_payment(db, bill_payment_id=pid, allocations=allocations)
     total = bill["paid_amount"] + request.amount
     execute(db, "UPDATE fleet_monthly_bill SET paid_amount=:total,status=:status WHERE bill_id=:id",
-            id=bill_id, total=total, status="paid" if total == bill["payable_amount"] else "partially_paid")
+            id=bill_id, total=total, status=("issued" if bill["payable_amount"] < 0 else
+                "paid" if total == bill["payable_amount"] else "partially_paid"))
     return one(db, "SELECT * FROM fleet_bill_payment WHERE bill_payment_id=:id", id=pid)

@@ -1,0 +1,10 @@
+
+Running 3 tests using 1 worker
+
+(node:295580) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+  ok 1 tests\settlement.spec.js:19:1 › real settlement, difference, adjustment, reconfirmation, blue and red invoice (6.2s)
+  ok 2 tests\settlement.spec.js:98:1 › owner application and customer invoice processing retains reason (1.0s)
+  ok 3 tests\settlement.spec.js:119:1 › fleet partial receipt, duplicate trade, overpayment and fleet read-only UI (1.5s)
+
+  3 passed (10.8s)

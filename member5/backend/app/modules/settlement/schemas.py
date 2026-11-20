@@ -66,6 +66,15 @@ class DifferenceQuery(OperatorInvoiceQuery):
     status: str | None = None
 
 
+class AdjustmentQuery(DifferenceQuery):
+    pass
+
+
+class AuditQuery(PageQuery):
+    object_type: Literal["settlement", "difference", "adjustment", "operator_invoice", "user_invoice"]
+    object_id: Id
+
+
 class UserInvoiceQuery(PageQuery):
     user_id: Id | None = None
     status: str | None = None

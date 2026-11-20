@@ -73,7 +73,7 @@ def create_app(database_url=None, jwt_secret=None, frontend_dir=None):
         for path in ("/settlement/settlements", "/settlement/settlements/{settlement_id:int}",
                      "/settlement/differences", "/settlement/invoices", "/settlement/user-invoices",
                      "/settlement/fleet-bills", "/settlement/fleet-bills/{bill_id:int}",
-                     "/settlement/fleet-prices", "/settlement/policies"):
+                     "/settlement/fleet-prices", "/settlement/policies", "/settlement/adjustments"):
             app.add_api_route(path, settlement_page, include_in_schema=False)
         app.mount("/", StaticFiles(directory=Path(frontend_dir), html=True))
     return app

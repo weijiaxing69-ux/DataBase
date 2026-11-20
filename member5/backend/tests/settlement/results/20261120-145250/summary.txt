@@ -1,0 +1,4 @@
+UTC: 2026-11-20T06:52:50.519758+00:00
+Python: 3.14.3
+Database: isolated MySQL; not the local application database.
+PASS: pytest; exit=0

@@ -6,8 +6,10 @@ from ...core.database import all_rows, execute, one
 from ...core.errors import require
 from ..billing.queries import list_billable_orders
 from . import dao
+from .audit import record
 from .catalog import (create_settlement_policy, get_operator_invoice, get_settlement_policy,
-                      list_differences, list_operator_invoices, list_settlement_policies, list_settlements)
+                      list_differences, list_operator_invoices, list_settlement_policies, list_settlements,
+                      list_adjustments, get_adjustment, list_audit_events)
 from .reconciliation import (add_confirmation, adjust_settlement, confirmation_side, confirm_difference,
                              create_difference, get_difference, insert_difference,
                              resolve_difference, review_settlement_adjustment)
@@ -68,10 +70,12 @@ def red_issue_operator_invoice(db, *, actor, invoice_id, request):
     scope(db, actor, write=True)
     original = one(db, "SELECT * FROM operator_invoice WHERE invoice_id=:id", id=invoice_id)
     require(original is not None, 404, "INVOICE_NOT_FOUND", "原票不存在。")
-    # V1.4 operator_invoice has no reason column. The request is kept in the idempotency digest.
-    return dao.invoice_procedure(db, original["settlement_id"],
+    result = dao.invoice_procedure(db, original["settlement_id"],
                                  "RED-" + uuid4().hex, invoice_id,
                                  original["title"], original["tax_no"], request.amount, actor["account_id"])
+    record(db, actor, "operator_invoice", invoice_id, "red_issue",
+           after={"red_invoice_id": result["invoice_id"], "amount": request.amount}, note=request.reason)
+    return result
 
 
 def cents(amount):

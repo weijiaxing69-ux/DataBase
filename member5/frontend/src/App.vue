@@ -16,6 +16,7 @@ const roleNames = { platform_admin: '平台管理员', operator_manager: '运营
 const links = [
   ['SettlementList', '运营商结算', ['platform_admin', 'operator_manager', 'customer_service']],
   ['DifferenceList', '对账差异', ['platform_admin', 'operator_manager', 'customer_service']],
+  ['AdjustmentList', '结算调整', ['platform_admin', 'operator_manager', 'customer_service']],
   ['InvoiceList', '运营商发票', ['platform_admin', 'operator_manager', 'customer_service']],
   ['UserInvoiceList', '车主发票', ['vehicle_owner', 'customer_service']],
   ['FleetBillList', '车队月结', ['fleet_admin', 'customer_service']],

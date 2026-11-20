@@ -16,6 +16,7 @@ const router = createRouter({
       ['differences', 'DifferenceList'], ['invoices', 'InvoiceList'], ['user-invoices', 'UserInvoiceList'],
       ['fleet-bills', 'FleetBillList'], ['fleet-bills/:billId(\\d+)', 'FleetBillDetail'],
       ['fleet-prices', 'FleetPriceList'], ['policies', 'SettlementPolicyList'],
+      ['adjustments', 'AdjustmentList'],
     ].map(([path, name]) => ({
       path: '/settlement/' + path, name, component: ModulePage,
       meta: { section: name === 'FleetBillDetail' ? 'FleetBillList' : name },

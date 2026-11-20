@@ -97,6 +97,7 @@ async function redIssue() {
   const { id, amount, reason } = red.value
   await mutate('/operator-invoices/' + id + '/red-issues', { amount, reason })
   await open(selected.value.settlement_id)
+  await load()
   notice.value = '红票已开具。'
 }
 onMounted(() => run(async () => {

@@ -2,24 +2,10 @@
 
 from pathlib import Path
 from secrets import token_urlsafe
-import sys
 import tempfile
 from uuid import uuid4
 
-from fastapi.testclient import TestClient
-
-ROOT = Path(__file__).resolve().parents[3]
-sys.path[:0] = [str(ROOT / "backend"), str(ROOT / "新能源项目最新版_V1.4")]
-
-from app.main import create_app
-from test_mysql_v14 import Instance, find_bin
-
-
-def install_settlement_sql(db):
-    folder = ROOT / "database/modules/settlement"
-    db.load()
-    for name in ("05_views.sql", "06_procedures.sql", "07_triggers.sql"):
-        db.query((folder / name).read_text(encoding="utf-8")).check_returncode()
+from support import ROOT, Instance, TestClient, create_app, find_bin, install_settlement_sql
 
 
 def verify(db):

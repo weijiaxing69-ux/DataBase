@@ -1,6 +1,9 @@
 import { request } from './http'
 
 const base = '/settlement'
+export const listAdjustments = (token, query) => read(token, '/adjustments', query)
+export const getAdjustment = (token, id) => read(token, '/adjustments/' + encodeURIComponent(id))
+export const listAuditEvents = (token, query) => read(token, '/audit-events', query)
 const read = (token, path, filters = {}) => request(base + path + '?' + new URLSearchParams(filters), { token })
 export const submitSettlement = (token, path, body, key) =>
   request(base + path, { token, method: 'POST', body, key })

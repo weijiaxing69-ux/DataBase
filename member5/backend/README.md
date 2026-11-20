@@ -41,7 +41,7 @@ $env:FRONTEND_DIST = (Resolve-Path './frontend/dist').Path
 
 登录使用 V1.4 测试包里的 `platform_admin_demo`、`operator_manager_demo`、`customer_service_demo`、`fleet_admin_demo`，车主发票可使用已关联车主档案的 `owner_01` 等账号，密码见测试包 README。历史十月结算单可直接查看详情。生成新结算单需要已付订单、退款或待核对订单；归集正单时须匹配有效分成政策。
 
-原本地开发账号如已按旧版配置，由本机数据库管理员执行 `database/modules/settlement/09_local_grants.sql` 补充新增业务所需权限。
+已有库先执行 `database/modules/settlement/10_audit.sql` 追加审计表。原本地开发账号再由管理员执行 `09_local_grants.sql` 补充权限，顺序是 10 后 09；不重建已有业务表。
 
 ## 联调约定
 
@@ -56,5 +56,5 @@ $env:FRONTEND_DIST = (Resolve-Path './frontend/dist').Path
 - 本地登录使用 V1.4 账号和会话表，合并时换成成员四的公共登录与 Actor 依赖。当前平台管理员和客服拥有结算列表及开票入口，运营商按账号关联范围查看，并需确认权限才能代表运营商确认。
 - `app/modules/billing/queries.py` 与 `service.py` 中的车队收款分配是成员二接口的本地实现。合并时要联调成功退款写入、原账单抵扣回调、月结收款分配、额度和车队专价审批。专价在本模块仅创建草稿，启用归成员二的价格审批。
 - 账期按北京时间划分。归集正单保留原订单结束时刻，退款按成功时刻独立冲减；调整由另一名管理员审批，审批通过后升版并重新确认。
-- 当前 V1.4 表未提供发票红冲原因、车主发票办理说明和调整审批依据的独立字段。这些请求字段会参与幂等校验；需要长期可查询时，应统一补审计存储。
-- 在隔离实例复验：`python backend/tests/settlement/test_flow.py` 和 `python backend/tests/settlement/test_v14_contract.py`。后者核对 30 个 HTTP 方法与路径、9 个页面入口，并测试差异确认、调整升版、发票、车队收款和退款补缴。
+- 已通过追加审计记录保存处理结论历史、审批依据、发票办理说明及红冲原因。新增结算调整列表和操作记录入口。扩展接口、角色矩阵及迁移见 `backend/tests/settlement/CHANGES_2026-11-20.md`。
+- 测试依赖安装：`python -m pip install -r backend/requirements-test.txt`。标准入口 `python -m pytest -q backend/tests/settlement`；归档仍使用 run_acceptance.py。前端真实写流程：`npm.cmd --prefix frontend run test:e2e`，首次需安装 Playwright Chromium。

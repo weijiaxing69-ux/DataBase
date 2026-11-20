@@ -1,6 +1,6 @@
 # 成员五结算持久层验收
 
-本目录包含可直接运行的验收脚本。它们会启动隔离 MySQL 实例并装载统一 V1.4 数据，不修改网页所连接的开发库。需要本机已经安装 MySQL Server/客户端、项目 Python 依赖，以及原目录中的 V1.4 测试包。
+本目录提供标准 pytest 验收和兼容的直接运行脚本。测试启动隔离 MySQL，装载 V1.4 与 10_audit.sql，不修改网页所连接的开发库。需要本机 MySQL Server/客户端、backend/requirements-test.txt 依赖及原目录中的 V1.4 测试包。
 
 在项目根目录执行：
 
@@ -8,7 +8,7 @@
 .\.venv\Scripts\python.exe -u .\backend\tests\settlement\run_acceptance.py
 ```
 
-脚本依次执行四个验收文件，每个文件必须退出码为 0。运行结果保存在本目录的 `results/时间戳/`，包含四份原始输出和一份 summary.txt。日志供组长归档；提交代码时一并带上脚本、日志和测试包依赖。合并后的服务实现发生变化时，必须在最终代码上复跑，不能将独立模块的日志当作已完成小组联调。
+脚本运行 pytest，结果保存在 `results/时间戳/`，包含原始日志、JUnit XML 和 summary.txt。也可直接执行 `python -m pytest -q backend/tests/settlement`。合并后必须复跑，独立模块日志不代替小组联调。
 
 | 文件 | 验证内容 |
 | --- | --- |
@@ -16,6 +16,8 @@
 | test_flow.py | 身份及运营商范围、分页、生成、双方确认、开票、幂等与红冲 |
 | test_v14_contract.py | V1.4 接口和函数签名、页面入口、差异处理、调整升版、消费发票、车队现金与抵扣、退款及补缴 |
 | test_concurrency.py | 五组真实 MySQL 并发或历史验证，见下表 |
+| test_regressions.py | 负余额先结清旧订单、零现金纯抵扣、正常抵扣、操作审计与回滚、调整查询、角色拒绝矩阵 |
+| test_acceptance.py、conftest.py | 统一 pytest 入口与隔离库共用夹具 |
 
 | 编号 | 场景 | 成功标准 |
 | --- | --- | --- |
@@ -27,6 +29,6 @@
 
 并发测试使用两个不同的 MySQL CONNECTION_ID、独立事务和同步屏障。普通 Service 在首个 FOR UPDATE 前同步；底层游标执行的开票过程在调用前同步，不为测试添加生产代码没有的锁。失败后从新连接读取数据库，核对实际记录数量和金额。
 
-历史测试验证的是确认记录和意见留存。V1.4 的差异表只保存当前处理结论，尚无单独的结论修订历史表；不得把确认意见的历史当作完整的结论审计。
+10_audit.sql 的追加审计记录补足差异结论修订、审批依据、办理说明和红冲原因；test_regressions.py 检查修改前后值、对象权限、审计写失败时业务回滚。历史种子不补造记录。
 
-当前测试采用直接 Python 入口；仅用 pytest 收集测试目录不能证明这些脚本执行过。请以运行命令、退出码和原始日志为准。
+真实网页测试：先安装前端依赖与 Chromium，再执行 `npm.cmd --prefix frontend run test:e2e`。它自动启动隔离数据库和后端，覆盖结算/差异/调整/重确认/开票/红冲、车主发票、车队分次收款及角色切换。原始输出归档于 results/browser，HTML 报告在 frontend/playwright-report。

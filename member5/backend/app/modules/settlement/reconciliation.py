@@ -1,5 +1,6 @@
 from ...core.database import all_rows, execute, one
 from ...core.errors import require
+from .audit import record
 
 
 def confirmation_side(db, actor, operator_id):
@@ -78,6 +79,10 @@ def resolve_difference(db, *, actor, difference_id, request):
     execute(db, """UPDATE reconciliation_difference SET resolution=:resolution,
         version=version+1,status='pending_confirmation' WHERE difference_id=:id""",
         resolution=request.resolution, id=difference_id)
+    record(db, actor, "difference", difference_id, "resolve", before={
+        "resolution": row["resolution"], "version": row["version"], "status": row["status"]},
+        after={"resolution": request.resolution, "version": row["version"]+1,
+               "status": "pending_confirmation"}, version=row["version"]+1)
     return difference_row(db, difference_id)
 
 
@@ -113,6 +118,8 @@ def adjust_settlement(db, *, actor, settlement_id, request):
         (settlement_id,difference_id,amount,reason,requested_by)
         VALUES(:id,:difference_id,:amount,:reason,:actor)""",
         id=settlement_id, actor=actor["account_id"], **request.model_dump())
+    record(db, actor, "adjustment", result.lastrowid, "request",
+           after={"settlement_id": settlement_id, **request.model_dump()}, note=request.reason)
     return one(db, "SELECT * FROM settlement_adjustment WHERE adjustment_id=:id", id=result.lastrowid)
 
 
@@ -138,4 +145,9 @@ def review_settlement_adjustment(db, *, actor, adjustment_id, request):
     execute(db, """UPDATE settlement_adjustment SET status=:decision,approved_by=:actor,
         approved_at=UTC_TIMESTAMP(3) WHERE adjustment_id=:id""",
         id=adjustment_id, actor=actor["account_id"], decision=request.decision)
+    record(db, actor, "adjustment", adjustment_id, "review",
+        before={"status": row["status"], "settlement_version": bill["version"], "payable_amount": bill["payable_amount"]},
+        after={"status": request.decision, "settlement_version": bill["version"]+(request.decision == "approved"),
+               "payable_amount": bill["payable_amount"]+(row["amount"] if request.decision == "approved" else 0)},
+        note=request.note)
     return get_settlement(db, actor=actor, settlement_id=bill["settlement_id"])

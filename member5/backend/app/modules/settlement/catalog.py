@@ -114,3 +114,38 @@ def create_settlement_policy(db, *, actor, request):
         VALUES(:operator_id,:station_id,:electricity_share_rate,:service_share_rate,:platform_fee_rate,
         :payment_basis,:valid_from,:valid_until)""", **args)
     return get_settlement_policy(db, actor=actor, policy_id=result.lastrowid)
+
+
+def list_adjustments(db, *, actor, query):
+    return page(db, query, "settlement_adjustment v JOIN operator_settlement s USING(settlement_id)",
+                "adjustment_id", ("settlement_id", "status"), ("v.reason", "v.adjustment_id"),
+                scope=operator_scope(db, actor, "s.operator_id"))
+
+
+def get_adjustment(db, *, actor, adjustment_id):
+    from .service import get_settlement
+    row = one(db, "SELECT * FROM settlement_adjustment WHERE adjustment_id=:id", id=adjustment_id)
+    require(row, 404, "ADJUSTMENT_NOT_FOUND", "调整申请不存在。")
+    get_settlement(db, actor=actor, settlement_id=row["settlement_id"])
+    return row
+
+
+def list_audit_events(db, *, actor, query):
+    from . import service
+    readers = {
+        "settlement": (service.get_settlement, "settlement_id"),
+        "difference": (service.get_difference, "difference_id"),
+        "adjustment": (get_adjustment, "adjustment_id"),
+        "operator_invoice": (get_operator_invoice, "invoice_id"),
+        "user_invoice": (service.get_user_invoice, "user_invoice_id"),
+    }
+    reader, key = readers[query.object_type]
+    reader(db, actor=actor, **{key: query.object_id})
+    result = page(db, query, "settlement_audit_event v", "event_id", ("object_type", "object_id"),
+                  ("v.action", "v.note"))
+    import json
+    for row in result["items"]:
+        for name in ("before_state", "after_state"):
+            if isinstance(row[name], str):
+                row[name] = json.loads(row[name])
+    return result

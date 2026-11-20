@@ -10,7 +10,7 @@ from decimal import Decimal
 from uuid import uuid4
 from sqlalchemy.orm import Session
 
-from test_flow import ROOT, Instance, TestClient, create_app, find_bin, install_settlement_sql
+from support import ROOT, Instance, TestClient, create_app, find_bin, install_settlement_sql
 
 
 def contract(client):
@@ -20,7 +20,9 @@ def contract(client):
     declared = {(a["method"].lower(), a["path"]) for a in data["api"] if a["module"] == "settlement"}
     actual = {(method, path) for path, item in client.get("/openapi.json").json()["paths"].items()
               if path.startswith("/api/v1/settlement/") for method in item}
-    assert actual == declared, (declared - actual, actual - declared)
+    extensions = {("get", "/api/v1/settlement"+p) for p in
+                  ("/adjustments", "/adjustments/{adjustment_id}", "/audit-events")}
+    assert actual == declared | extensions, (declared - actual, actual - declared - extensions)
     for item in data["functions"]:
         if item["module"] == "settlement":
             module = pricing if item["file"] == "pricing.py" else service

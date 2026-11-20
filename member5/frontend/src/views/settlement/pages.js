@@ -43,6 +43,14 @@ const redOn = (base, key) => action('红冲', base === 'user-invoices' ? staff :
 const fleetRoles = [...staff, 'fleet_admin']
 
 export const pages = {
+  AdjustmentList: { title: '结算调整', roles: [...platform, 'operator_manager'], key: 'adjustment_id',
+    list: api.listAdjustments, detail: api.getAdjustment,
+    columns: { adjustment_id: '申请编号', settlement_id: '结算单', difference_id: '差异单', amount: '调整金额',
+      reason: '申请原因', requested_by: '申请人', status: '状态', approved_by: '审批人', approved_at: '审批时间' },
+    filters: [id('settlement_id', '结算单'), statuses({ pending: '待审批', approved: '已批准', rejected: '已驳回' })],
+    actions: [action('审批调整', admin, row => `/adjustments/${row.adjustment_id}/reviews`,
+      [options('decision', '审批结果', { approved: '批准', rejected: '驳回' }), note('note', '审批依据')],
+      row => row.status === 'pending')] },
   DifferenceList: { title: '对账差异', roles: [...platform, 'operator_manager'], key: 'difference_id',
     list: api.listDifferences, detail: api.getDifference, columns: columns.difference,
     filters: [id('settlement_id', '结算单'), statuses({ open: '待处理', pending_confirmation: '待确认', effective: '已生效', rejected: '有异议' })],
@@ -59,10 +67,7 @@ export const pages = {
         [money(), note('reason', '调整原因')], row => row.status === 'effective',
         (body, row) => ({ ...body, difference_id: row.difference_id })),
     ],
-    review: action('审批调整', admin, row => `/adjustments/${row.adjustment_id}/reviews`,
-      [id('adjustment_id', '调整申请编号'),
-        options('decision', '审批结果', { approved: '批准', rejected: '驳回' }), note('note', '审批依据')], undefined,
-      ({ decision, note }) => ({ decision, note })) },
+    },
   InvoiceList: { title: '运营商发票', roles: [...platform, 'operator_manager'], key: 'invoice_id',
     list: api.listOperatorInvoices, detail: api.getOperatorInvoice, columns: columns.invoice,
     filters: [id('settlement_id', '结算单')], actions: [redOn('operator-invoices', 'invoice_id')] },

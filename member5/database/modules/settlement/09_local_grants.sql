@@ -24,3 +24,5 @@ GRANT UPDATE (refund_id) ON charging_platform.refund_record TO 'charging_settlem
 GRANT UPDATE (policy_id) ON charging_platform.settlement_policy TO 'charging_settlement_dev'@'127.0.0.1';
 GRANT UPDATE (bill_payment_id) ON charging_platform.fleet_bill_payment TO 'charging_settlement_dev'@'127.0.0.1';
 GRANT UPDATE (invoice_id) ON charging_platform.operator_invoice TO 'charging_settlement_dev'@'127.0.0.1';
+-- Install 10_audit.sql before running this account-specific grant script.
+GRANT SELECT, INSERT ON charging_platform.settlement_audit_event TO 'charging_settlement_dev'@'127.0.0.1';

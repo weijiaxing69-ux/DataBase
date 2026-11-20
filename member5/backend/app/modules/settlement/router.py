@@ -16,6 +16,21 @@ Actor = Annotated[dict, Depends(current_actor)]
 IdempotencyKey = Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=64)]
 
 
+@router.get("/adjustments")
+def list_adjustments(query: Annotated[schemas.AdjustmentQuery, Query()], db: DB, actor: Actor):
+    return wire(service.list_adjustments(db, actor=actor, query=query))
+
+
+@router.get("/adjustments/{adjustment_id}")
+def get_adjustment(adjustment_id: schemas.Id, db: DB, actor: Actor):
+    return wire(service.get_adjustment(db, actor=actor, adjustment_id=adjustment_id))
+
+
+@router.get("/audit-events")
+def list_audit_events(query: Annotated[schemas.AuditQuery, Query()], db: DB, actor: Actor):
+    return wire(service.list_audit_events(db, actor=actor, query=query))
+
+
 def write_once(db, actor, key, operation, target, body, status, action):
     request_hash = sha256(json.dumps([target, body.model_dump(mode="json")],
                                      sort_keys=True, ensure_ascii=False).encode()).digest()

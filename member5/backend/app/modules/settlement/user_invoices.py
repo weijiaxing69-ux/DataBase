@@ -4,6 +4,7 @@ from uuid import uuid4
 from ...core.database import all_rows, execute, one
 from ...core.errors import require
 from .catalog import page
+from .audit import record
 
 
 def access(actor, user_id=None, *, staff=False):
@@ -114,6 +115,8 @@ def process_user_invoice(db, *, actor, user_invoice_id, request):
         number="USER-BLUE-"+uuid4().hex if issue else None, actor=actor["account_id"])
     execute(db, "UPDATE user_invoice_item SET status=:status WHERE user_invoice_id=:id",
             status="effective" if issue else "released", id=user_invoice_id)
+    record(db, actor, "user_invoice", user_invoice_id, "process",
+           before={"status": row["status"]}, after={"status": request.decision}, note=request.note)
     return invoice_row(db, user_invoice_id)
 
 
@@ -146,4 +149,6 @@ def red_issue_user_invoice(db, *, actor, user_invoice_id, request):
     for oid, amount in allocations:
         execute(db, """INSERT INTO user_invoice_item(user_invoice_id,order_id,allocated_amount,status)
             VALUES(:id,:order,:amount,'effective')""", id=result.lastrowid, order=oid, amount=amount)
+    record(db, actor, "user_invoice", user_invoice_id, "red_issue",
+           after={"red_invoice_id": result.lastrowid, "amount": request.amount}, note=request.reason)
     return invoice_row(db, result.lastrowid)

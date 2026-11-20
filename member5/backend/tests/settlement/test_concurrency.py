@@ -7,7 +7,7 @@ from secrets import token_urlsafe
 from threading import Barrier
 import tempfile
 
-from test_flow import Instance, TestClient, create_app, find_bin, install_settlement_sql
+from support import Instance, TestClient, create_app, find_bin, install_settlement_sql
 from sqlalchemy import event, text
 from sqlalchemy.orm import Session
 from pymysql.err import MySQLError
