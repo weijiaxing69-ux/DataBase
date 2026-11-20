@@ -925,19 +925,30 @@ def list_long_charging_orders(db: Session, before, now):
 
 
 def list_voltage_anomalies(db: Session, since, lower_v: float, upper_v: float, amps: float, samples: int):
-    """有输出电流但电压越限：电网波动、接触不良、整流异常。"""
+    """有输出电流且最近连续 N 条采样全部越限：电网波动、接触不良、整流异常。
+
+    先按桩取最近 N 条，再要求这 N 条全部有电流且全部越限；
+    避免窗口内零散几条异常样本被误判成“连续越限”。
+    """
     rows = db.execute(
         text(
-            """select r.pile_id,
-                      min(r.output_voltage_v) as min_voltage,
-                      max(r.output_voltage_v) as max_voltage,
+            """select pile_id,
+                      min(output_voltage_v) as min_voltage,
+                      max(output_voltage_v) as max_voltage,
                       count(*) as n
-                 from device_reading r
-                where r.sampled_at >= :since
-                  and r.output_current_a > :amps
-                  and (r.output_voltage_v < :lower_v or r.output_voltage_v > :upper_v)
-                group by r.pile_id
-               having count(*) >= :samples"""
+                 from (
+                   select r.pile_id, r.sampled_at, r.output_voltage_v, r.output_current_a,
+                          row_number() over (
+                            partition by r.pile_id order by r.sampled_at desc
+                          ) as rn
+                     from device_reading r
+                    where r.sampled_at >= :since
+                 ) t
+                where rn <= :samples
+                  and output_current_a > :amps
+                  and (output_voltage_v < :lower_v or output_voltage_v > :upper_v)
+                group by pile_id
+               having count(*) = :samples"""
         ),
         {"since": since, "lower_v": lower_v, "upper_v": upper_v,
          "amps": amps, "samples": samples},
@@ -1024,30 +1035,47 @@ def list_order_sampling_gaps(db: Session, since, before):
 
 
 def list_overloaded_stations(db: Session, since, threshold_kw: float):
-    """场站级功率过载：先按桩取窗口内峰值，再按场站求和，返回超阈值的场站与代表桩。
+    """场站级功率过载：按同一分钟时间片汇总，避免把不同时刻的峰值相加。
 
-    代表桩取该场站峰值功率最高的桩，避免同一场站重复建多告警。
+    先按“桩 × 分钟”取该分钟峰值，再按“场站 × 分钟”求和；
+    最后取每个场站最严重的分钟，并选该分钟功率最高的桩作为告警载体。
     """
     rows = db.execute(
         text(
             """select s.station_id, s.station_name, t.pile_id,
-                      t.pile_peak_kw, t.station_peak_kw
+                      t.minute_bucket, t.pile_power, t.station_peak_kw
                  from (
-                   select a.station_id, a.pile_id, a.pile_peak_kw,
-                          sum(a.pile_peak_kw) over (partition by a.station_id) as station_peak_kw,
+                   select x.station_id, x.minute_bucket, x.pile_id, x.pile_power,
+                          x.station_peak_kw,
                           row_number() over (
-                            partition by a.station_id order by a.pile_peak_kw desc, a.pile_id
-                          ) as rn
+                            partition by x.station_id
+                            order by x.station_peak_kw desc, x.minute_bucket
+                          ) as station_rn
                      from (
-                       select p.station_id, r.pile_id, max(r.power_kw) as pile_peak_kw
-                         from device_reading r
-                         join charging_pile p on p.pile_id = r.pile_id
-                        where r.sampled_at >= :since
-                        group by p.station_id, r.pile_id
-                     ) a
+                       select a.station_id, a.minute_bucket, a.pile_id, a.pile_power,
+                              sum(a.pile_power) over (
+                                partition by a.station_id, a.minute_bucket
+                              ) as station_peak_kw,
+                              row_number() over (
+                                partition by a.station_id, a.minute_bucket
+                                order by a.pile_power desc, a.pile_id
+                              ) as pile_rn
+                         from (
+                           select p.station_id,
+                                  floor(unix_timestamp(r.sampled_at) / 60) as minute_bucket,
+                                  r.pile_id,
+                                  max(r.power_kw) as pile_power
+                             from device_reading r
+                             join charging_pile p on p.pile_id = r.pile_id
+                            where r.sampled_at >= :since
+                            group by p.station_id, minute_bucket, r.pile_id
+                         ) a
+                     ) x
+                    where x.pile_rn = 1
                  ) t
                  join station s on s.station_id = t.station_id
-                where t.rn = 1 and t.station_peak_kw > :threshold"""
+                where t.station_rn = 1 and t.station_peak_kw > :threshold
+                order by t.station_peak_kw desc"""
         ),
         {"since": since, "threshold": threshold_kw},
     ).mappings().all()

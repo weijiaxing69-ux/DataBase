@@ -1,0 +1,7 @@
+UTC: 2026-11-20T07:25:52.251506+00:00
+Python: 3.13.14
+Database: isolated MySQL charging_platform_test (rebuild_demo_db.py --with-emergency)
+Scope: maintenance service/integration/HTTP smoke + two-client concurrency
+PASS: seed_counts; exit=0
+PASS: full_tests; exit=0
+PASS: maintenance_tests; exit=0

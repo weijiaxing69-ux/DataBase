@@ -1264,8 +1264,10 @@ def test_long_charging_notifies(db):
 def test_voltage_anomaly_creates_alert(db):
     pile_id = 15
     db.execute(text("delete from device_alert where alert_code = 'VLT01' and pile_id = :p"), {"p": pile_id})
-    db.commit()
     now = ms_now()
+    db.execute(text("delete from device_reading where pile_id = :p and sampled_at >= :t"),
+               {"p": pile_id, "t": now - timedelta(minutes=10)})
+    db.commit()
     try:
         for offset in (30, 60):
             db.execute(text(
@@ -1286,6 +1288,35 @@ def test_voltage_anomaly_creates_alert(db):
             "select alert_id from device_alert where alert_code = 'VLT01' and pile_id = :p"), {"p": pile_id})])
         db.execute(text("delete from device_reading where pile_id = :p and sampled_at >= :t"),
                    {"p": pile_id, "t": now - timedelta(minutes=10)})
+        db.commit()
+
+
+def test_voltage_anomaly_requires_latest_consecutive_samples(db):
+    pile_id = 16
+    now = ms_now()
+    db.execute(text("delete from device_reading where pile_id = :p and sampled_at >= :t"),
+               {"p": pile_id, "t": now - timedelta(minutes=15)})
+    db.commit()
+    try:
+        # 时间从早到晚：正常、越限、正常、越限；最近两条不是连续越限
+        values = [(400, 240), (250, 180), (400, 120), (250, 60)]
+        for voltage, offset in values:
+            db.execute(text(
+                """insert into device_reading
+                   (pile_id, sampled_at, output_voltage_v, output_current_a, power_kw,
+                    module_temperature_c, offline_seconds, fault_code)
+                   values (:p, :t, :v, 12, 3, 40, 0, 'NONE')"""
+            ), {"p": pile_id, "t": now - timedelta(seconds=offset), "v": voltage})
+        db.commit()
+
+        assert service.check_voltage_anomaly(db, now=now, samples=2) == 0
+    finally:
+        ids = [r[0] for r in db.execute(text(
+            "select alert_id from device_alert where alert_code = 'VLT01' and pile_id = :p"
+        ), {"p": pile_id}).all()]
+        _cleanup_alert_chain(db, ids)
+        db.execute(text("delete from device_reading where pile_id = :p and sampled_at >= :t"),
+                   {"p": pile_id, "t": now - timedelta(minutes=15)})
         db.commit()
 
 
@@ -1400,6 +1431,12 @@ def test_order_sampling_gap_notifies(db):
         db.execute(text("delete from notification where notification_type = 'sampling_gap'"))
         db.execute(text("delete from charging_order where gun_id = 20 and status = 'charging'"))
         db.commit()
+
+
+def test_scheduler_covers_all_tasks():
+    from app.modules.maintenance import scheduler
+
+    assert set(scheduler.TASK_INTERVALS) == set(service.TASKS)
 
 
 # ---------------------------------------------------------------------------
@@ -1550,6 +1587,36 @@ def test_station_overload_creates_one_alert(db):
         {"t": sampled_at},
     )
     db.commit()
+
+
+def test_station_overload_ignores_peaks_at_different_times(db):
+    now = ms_now()
+    db.execute(text("delete from device_reading where pile_id in (901, 902) and sampled_at >= :t"),
+               {"t": now - timedelta(minutes=15)})
+    db.commit()
+    try:
+        # 两桩峰值分别出现在不同时间片，不能把两个 180kW 峰值相加成 360kW
+        for pile, offset in ((901, 5), (902, 9)):
+            db.execute(text(
+                """insert into device_reading
+                   (pile_id, sampled_at, output_voltage_v, output_current_a, power_kw,
+                    module_temperature_c, offline_seconds, fault_code)
+                   values (:p, :t, 400, 400, 180, 40, 0, 'NONE')"""
+            ), {"p": pile, "t": now - timedelta(minutes=offset)})
+        db.commit()
+
+        created = service.check_station_overload(
+            db, now=now, window_minutes=10, threshold_kw=300
+        )
+        assert created == 0
+    finally:
+        ids = [r[0] for r in db.execute(text(
+            "select alert_id from device_alert where alert_code = 'CAP01'"
+        )).all()]
+        _cleanup_alert_chain(db, ids)
+        db.execute(text("delete from device_reading where pile_id in (901, 902) and sampled_at >= :t"),
+                   {"t": now - timedelta(minutes=15)})
+        db.commit()
 
 
 # ---------------------------------------------------------------------------
